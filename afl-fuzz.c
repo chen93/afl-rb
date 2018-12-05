@@ -316,7 +316,7 @@ static u8 skip_deterministic_bootstrap = 0;
 
 static int trim_for_branch = 0;
 
-/* @afl-cfg */
+/* @afl-cfg: control flow graph node information */
 struct cfg_node {
     u32 addr;
 
@@ -334,6 +334,23 @@ struct cfg_node {
 
 int cfg_nodes_cnt = 0;
 static struct cfg_node *cfg_nodes;
+
+/* @afl-cfg: control flow graph edge information */
+enum JumpKind {
+    Ijk_Boring =0,
+    Ijk_Call,
+    Ijk_Ret,
+    Ijk_FakeRet,
+};
+
+struct cfg_edge {
+    bool marked;
+    bool crash;
+    enum JumpKind jk;
+    struct cfg_node *cur_node;
+    struct cfg_node *next_node;
+};
+static struct cfg_edge cfg_edges[MAP_SIZE];
 
 /* Interesting values, as per config.h */
 
@@ -7970,6 +7987,8 @@ static int compare_cfg_node(const void* p1, const void* p2) {
   }
 }
 
+/* @afl-cfg: binary search a node
+ * return: node's index in array */
 static int binary_search_cfg_node_idx(u32 addr)
 {
     int mid = 0;
@@ -7989,6 +8008,8 @@ static int binary_search_cfg_node_idx(u32 addr)
     return -1;
 }
 
+/* @afl-cfg: binary search a node
+ * return: node's point */
 static struct cfg_node *binary_search_cfg_node(u32 addr)
 {
     int idx = binary_search_cfg_node_idx(addr);
@@ -7999,11 +8020,13 @@ static struct cfg_node *binary_search_cfg_node(u32 addr)
     }
 }
 
+/* @afl-cfg */
 static u32 get_cfg_node_addr(char *str)
 {
    char *p_end = str + strlen("node: ");
    return strtol(p_end, &p_end, 16);
 }
+
 /* @afl-cfg: load cfg's nodes to cfg_nodes[].
  * scan twice of the file "nodes.txt" to load the info.
  * node info will put into the global array cfg_nodes[].
@@ -8054,7 +8077,7 @@ static int load_cfg_nodes()
             }
             len += strlen(line);
         } while (strlen(line) == 1023 && line[1022] != '\n');
-        s_cnt[i] = (len - strlen("    successores: ")) / 9;
+        s_cnt[i] = (len - strlen("    successores:")) / 9;
 
         len = 0;
         do {
@@ -8064,7 +8087,7 @@ static int load_cfg_nodes()
             }
             len += strlen(line);
         } while (strlen(line) == 1023 && line[1022] != '\n');
-        p_cnt[i] = (len - strlen("    predecessores: ")) / 9;
+        p_cnt[i] = (len - strlen("    predecessores:")) / 9;
 
         i++;
     }
@@ -8166,6 +8189,87 @@ static int load_cfg_nodes()
     free(addrs);
     free(s_cnt);
     free(p_cnt);
+    return 0;
+}
+
+/* @afl-cfg: load cfg's edges to cfg_edges[].
+ * scan the file "edges.txt" to load the info
+ * into the global array cfg_edges[].
+ * return: 0 if success, -1 if failed */
+static int load_cfg_edges()
+{
+    FILE *fp;
+    char line[256];
+
+    /* open edges.txt */
+    fp = fopen("edges.txt", "r");
+    if (!fp) {
+        PFATAL("Unable to open edges.txt");
+        return -1;
+    }
+
+    while(!feof(fp)) {
+        char *str;
+        u32 cur_addr, next_addr;
+        u32 cur_loc, next_loc, edge_loc;
+        enum JumpKind jk;
+
+        if (fgets(line, 256, fp) == NULL) {
+            if (feof(fp)) {
+                break;
+            }
+            PFATAL("build cfg edge list failed when read file");
+            return -1;
+        }
+        str = line;
+        str += strlen("cur: ");
+        cur_addr = strtol(str, &str, 16);
+        str += 2;
+        str += strlen("next: ");
+        next_addr = strtol(str, &str, 16);
+        str += 2;
+        str += strlen("jumpkind: ");
+
+        /* get edge jumpkind, if fakeret, ignore */
+        if (strncmp(str, "Ijk_FakeRet", strlen("Ijk_FakeRet")) == 0) {
+            break;
+        } else if (strncmp(str, "Ijk_Boring", strlen("Ijk_Boring")) == 0) {
+            jk = Ijk_Boring;
+        } else if (strncmp(str, "Ijk_Call", strlen("Ijk_Call")) == 0) {
+            jk = Ijk_Call;
+        } else if (strncmp(str, "Ijk_Ret", strlen("Ijk_Ret")) == 0) {
+            jk = Ijk_Ret;
+        }
+
+        cur_loc = (cur_addr >> 4) ^ (cur_addr << 8);
+        cur_loc &= (MAP_SIZE - 1);
+        cur_loc = cur_loc >> 1;
+
+        next_loc = (next_addr >> 4) ^ (next_addr << 8);
+        next_loc &= (MAP_SIZE - 1);
+
+        edge_loc = cur_loc ^ next_loc;
+
+        /* if crashed, only record the first edge */
+        if (cfg_edges[edge_loc].marked) {
+            if (cfg_edges[edge_loc].cur_node->addr != cur_addr
+                || cfg_edges[edge_loc].next_node->addr != next_addr) {
+                cfg_edges[edge_loc].crash = true;
+            } else {
+                continue;
+            }
+        }
+
+        cfg_edges[edge_loc].marked = true;
+        cfg_edges[edge_loc].jk = jk;
+        cfg_edges[edge_loc].cur_node = binary_search_cfg_node(cur_addr);
+        cfg_edges[edge_loc].next_node = binary_search_cfg_node(next_addr);
+        if (cfg_edges[edge_loc].cur_node == NULL
+                || cfg_edges[edge_loc].next_node == NULL) {
+            PFATAL("search edge %x->%x faild!", cur_addr, next_addr);
+            return -1;
+        }
+    }
     return 0;
 }
 
@@ -9208,6 +9312,10 @@ int main(int argc, char** argv) {
   check_binary(argv[optind]);
 
   if (load_cfg_nodes() == -1) {
+    return -1;
+  }
+
+  if (load_cfg_edges() == -1) {
     return -1;
   }
 
