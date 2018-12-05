@@ -316,6 +316,24 @@ static u8 skip_deterministic_bootstrap = 0;
 
 static int trim_for_branch = 0;
 
+/* @afl-cfg */
+struct cfg_node {
+    u32 addr;
+
+    bool visited;
+    u32 covered_blocks;
+    u32 hits;
+    u32 scores;
+
+    u32 s_size;
+    struct cfg_node **successors;
+
+    u32 p_size;
+    struct cfg_node **predecessors;
+};
+
+int cfg_nodes_cnt = 0;
+static struct cfg_node *cfg_nodes;
 
 /* Interesting values, as per config.h */
 
@@ -7940,6 +7958,216 @@ EXP_ST void check_binary(u8* fname) {
 
 }
 
+/* @afl-cfg: sort cfg nodes array by node's address */
+static int compare_cfg_node(const void* p1, const void* p2) {
+  struct cfg_node *node1 = (struct cfg_node *)p1,
+                  *node2 = (struct cfg_node *)p2;
+
+  if (node1->addr < node2->addr) {
+    return -1;
+  } else {
+    return 1;
+  }
+}
+
+static int binary_search_cfg_node_idx(u32 addr)
+{
+    int mid = 0;
+    int left = 0;
+    int right = cfg_nodes_cnt;
+
+    while (left <= right)
+    {
+        mid = (left + right) >> 1;
+        if (addr < cfg_nodes[mid].addr)
+            right = mid - 1;
+        else if (addr > cfg_nodes[mid].addr)
+            left = mid + 1;
+        else
+            return mid;
+    }
+    return -1;
+}
+
+static struct cfg_node *binary_search_cfg_node(u32 addr)
+{
+    int idx = binary_search_cfg_node_idx(addr);
+    if (idx != -1) {
+        return &cfg_nodes[idx];
+    } else {
+        return NULL;
+    }
+}
+
+static u32 get_cfg_node_addr(char *str)
+{
+   char *p_end = str + strlen("node: ");
+   return strtol(p_end, &p_end, 16);
+}
+/* @afl-cfg: load cfg's nodes to cfg_nodes[].
+ * scan twice of the file "nodes.txt" to load the info.
+ * node info will put into the global array cfg_nodes[].
+ * return: 0 if success, -1 if failed */
+static int load_cfg_nodes()
+{
+    FILE *fp;
+    char line[1024];
+    u32 *addrs, *s_cnt, *p_cnt;
+    u32 size, i = 0;
+    int ret;
+
+    /* open nodes.txt */
+    fp = fopen("nodes.txt", "r");
+    if (!fp) {
+        PFATAL("Unable to open nodes.txt");
+        return -1;
+    }
+
+    /* cnt the nodes and get node's addr into array */
+    addrs = malloc(sizeof(u32) * 100);
+    s_cnt = malloc(sizeof(u32) * 100);
+    p_cnt = malloc(sizeof(u32) * 100);
+    size = 100;
+    while (!feof(fp)) {
+        int len = 0;
+
+        if (i == size) {
+            addrs = realloc(addrs, (size + 100) * sizeof(u32));
+            s_cnt = realloc(s_cnt, (size + 100) * sizeof(u32));
+            p_cnt = realloc(p_cnt, (size + 100) * sizeof(u32));
+            size += 100;
+        }
+
+        if (fgets(line, 1024, fp) == NULL) {
+            if (feof(fp)) {
+                break;
+            }
+            PFATAL("build cfg node list failed when read file");
+            return -1;
+        }
+        addrs[i] = get_cfg_node_addr(line);
+
+        do {
+            if (fgets(line, 1024, fp) == NULL) {
+                PFATAL("build cfg node list failed when read file");
+                return -1;
+            }
+            len += strlen(line);
+        } while (strlen(line) == 1023 && line[1022] != '\n');
+        s_cnt[i] = (len - strlen("    successores: ")) / 9;
+
+        len = 0;
+        do {
+            if (fgets(line, 1024, fp) == NULL) {
+                PFATAL("build cfg node list failed when read file");
+                return -1;
+            }
+            len += strlen(line);
+        } while (strlen(line) == 1023 && line[1022] != '\n');
+        p_cnt[i] = (len - strlen("    predecessores: ")) / 9;
+
+        i++;
+    }
+    cfg_nodes_cnt = i;
+
+    cfg_nodes = (struct cfg_node *)malloc(sizeof(struct cfg_node)
+            * cfg_nodes_cnt);
+    memset(cfg_nodes, 0, sizeof(struct cfg_node) * cfg_nodes_cnt);
+
+    for (i = 0; i < cfg_nodes_cnt; i++) {
+        cfg_nodes[i].addr = addrs[i];
+        cfg_nodes[i].s_size = s_cnt[i];
+        cfg_nodes[i].p_size = p_cnt[i];
+        cfg_nodes[i].successors = malloc(s_cnt[i] * sizeof(struct cfg_node *));
+        cfg_nodes[i].predecessors = malloc(p_cnt[i] * sizeof(struct cfg_node *));
+    }
+
+    qsort(cfg_nodes, cfg_nodes_cnt, sizeof(struct cfg_node), compare_cfg_node);
+
+    fseek(fp, 0, SEEK_SET);
+
+    for (i = 0; i < cfg_nodes_cnt; i++) {
+        int j;
+        struct cfg_node *node;
+
+        /* passby node: XXXX */
+        if (fgets(line, 1024, fp) == NULL) {
+            PFATAL("build cfg node list failed when read file");
+            return -1;
+        }
+        node = binary_search_cfg_node(addrs[i]);
+        if (node == NULL) {
+            PFATAL("build cfg node list failed when searching node %x",
+                    addrs[i]);
+            return -1;
+        }
+
+        /* passby str "successors:" */
+        ret = fscanf(fp, "%s:", line);
+        if (ret == -1) {
+            PFATAL("build cfg node list failed when read file");
+            return -1;
+        }
+        for (j = 0; j < s_cnt[i]; j++) {
+            u32 s_addr;
+            struct cfg_node *succ;
+
+            ret = fscanf(fp, "%x", &s_addr);
+            if (ret == -1) {
+                PFATAL("build cfg node list failed when read file");
+                return -1;
+            }
+            succ = binary_search_cfg_node(s_addr);
+
+            if (succ == NULL) {
+                PFATAL("build cfg node list failed when searching node %x",
+                        s_addr);
+                return -1;
+            }
+            node->successors[j] = succ;
+        }
+        /* passby " \n" */
+        if (fgets(line, 1024, fp) == NULL) {
+            PFATAL("build cfg node list failed when read file");
+            return -1;
+        }
+
+        /* passby str "predecessors:" */
+        ret = fscanf(fp, "%s:", line);
+        if (ret == -1) {
+            PFATAL("build cfg node list failed when read file");
+            return -1;
+        }
+        for (j = 0; j < p_cnt[i]; j++) {
+            u32 p_addr;
+            struct cfg_node *prede;
+
+            ret = fscanf(fp, "%x", &p_addr);
+            if (ret == -1) {
+                PFATAL("build cfg node list failed when read file");
+                return -1;
+            }
+            prede = binary_search_cfg_node(p_addr);
+
+            if (prede == NULL) {
+                PFATAL("build cfg node list failed when searching node %x",
+                        p_addr);
+                return -1;
+            }
+            node->predecessors[j] = prede;
+        }
+        /* passby " \n" */
+        if (fgets(line, 1024, fp) == NULL) {
+            PFATAL("build cfg node list failed when read file");
+            return -1;
+        }
+    }
+    fclose(fp);
+    free(addrs);
+    free(s_cnt);
+    free(p_cnt);
+    return 0;
+}
 
 /* Trim and possibly create a banner for the run. */
 
@@ -8978,6 +9206,10 @@ int main(int argc, char** argv) {
   if (!out_file) setup_stdio_file();
 
   check_binary(argv[optind]);
+
+  if (load_cfg_nodes() == -1) {
+    return -1;
+  }
 
   start_time = get_cur_time();
 
