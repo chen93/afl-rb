@@ -8270,6 +8270,7 @@ static int load_cfg_edges()
             return -1;
         }
     }
+    fclose(fp);
     return 0;
 }
 
