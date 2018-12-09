@@ -316,25 +316,29 @@ static u8 skip_deterministic_bootstrap = 0;
 static int trim_for_branch = 0;
 
 /* @afl-cfg: control flow graph node information */
+#define CFG_BLOCK_LEVEL     5
 struct cfg_node {
     u32 addr;
-    int depth;
+    int depth;              /* node's minimum depth in cfg */
 
-    bool visited;
-    u32 covered_blocks;
+    bool mapped;            /* whether this position is used in hash table */
+    bool visited;           /* whether this node is visited by some input */
+    bool covered;           /* flag use to calculate covered blocks */
+    u32 covered_blocks;     /* how many blocks is covered by this node,
+                               only count CFG_BLOCK_LEVEL below */
     u32 hits;
     u32 scores;
 
-    u32 s_size;
+    u32 s_size;             /* node's successors number */
     struct cfg_node **successors;
 
-    u32 p_size;
+    u32 p_size;             /* node's predecessors number */
     struct cfg_node **predecessors;
 };
 
 int cfg_nodes_cnt = 0;
+int cfg_hash_size = 0;
 static struct cfg_node *cfg_nodes;
-#define CFG_BLOCK_LEVEL     5
 
 /* @afl-cfg: control flow graph edge information */
 enum JumpKind {
@@ -467,22 +471,50 @@ static void cfg_update_predecessors_nodes(struct cfg_node *s, int l)
     u32 i;
     for (i = 0; i < s->p_size; i++) {
         struct cfg_node *p = s->predecessors[i];
+        if (p->covered == true) {
+            continue;
+        }
         p->covered_blocks--;
+        p->covered = true;
         if (l > 0) {
             cfg_update_predecessors_nodes(p, l - 1);
         }
     }
 }
 
+static void cfg_clear_covered_flag_up(struct cfg_node *s, int l)
+{
+    u32 i;
+
+    for (i = 0; i < s->p_size; i++) {
+        struct cfg_node *p = s->predecessors[i];
+        if (p->covered == false) {
+            continue;
+        }
+
+        p->covered = false;
+        if (l > 0) {
+            cfg_clear_covered_flag_up(p, l - 1);
+        }
+    }
+}
+
+
 static void update_cfg_nodes(u32 idx) {
     if (cfg_edges[idx].marked) {
         if (cfg_edges[idx].cur_node->visited == false) {
             cfg_edges[idx].cur_node->visited = true;
+            cfg_edges[idx].cur_node->covered = true;
             cfg_update_predecessors_nodes(cfg_edges[idx].cur_node, CFG_BLOCK_LEVEL - 1);
+            cfg_edges[idx].cur_node->covered = false;
+            cfg_clear_covered_flag_up(cfg_edges[idx].cur_node, CFG_BLOCK_LEVEL - 1);
         }
         if (cfg_edges[idx].next_node->visited == false) {
             cfg_edges[idx].next_node->visited = true;
+            cfg_edges[idx].next_node->covered = true;
             cfg_update_predecessors_nodes(cfg_edges[idx].next_node, CFG_BLOCK_LEVEL - 1);
+            cfg_edges[idx].next_node->covered = false;
+            cfg_clear_covered_flag_up(cfg_edges[idx].next_node, CFG_BLOCK_LEVEL - 1);
         }
     }
 }
@@ -8014,56 +8046,87 @@ EXP_ST void check_binary(u8* fname) {
 
 }
 
-/* @afl-cfg: sort cfg nodes array by node's address */
-static int compare_cfg_node(const void* p1, const void* p2) {
-  struct cfg_node *node1 = (struct cfg_node *)p1,
-                  *node2 = (struct cfg_node *)p2;
-
-  if (node1->addr < node2->addr) {
-    return -1;
-  } else {
-    return 1;
-  }
-}
-
-/* @afl-cfg: binary search a node
- * return: node's index in array */
-static int binary_search_cfg_node_idx(u32 addr)
-{
-    int mid = 0;
-    int left = 0;
-    int right = cfg_nodes_cnt;
-
-    while (left <= right)
-    {
-        mid = (left + right) >> 1;
-        if (addr < cfg_nodes[mid].addr)
-            right = mid - 1;
-        else if (addr > cfg_nodes[mid].addr)
-            left = mid + 1;
-        else
-            return mid;
-    }
-    return -1;
-}
-
-/* @afl-cfg: binary search a node
- * return: node's point */
-static struct cfg_node *binary_search_cfg_node(u32 addr)
-{
-    int idx = binary_search_cfg_node_idx(addr);
-    if (idx != -1) {
-        return &cfg_nodes[idx];
-    } else {
-        return NULL;
-    }
-}
-
 /* @afl-cfg */
 static u32 get_cfg_node_addr(char *str)
 {
    char *p_end = str + strlen("node: ");
    return strtol(p_end, &p_end, 16);
+}
+
+static int cfg_find_prime(int n)
+{
+    while(1) {
+        int i;
+        bool is_prime = true;
+        for (i = 2; i <= n/2; i++) {
+            if (n % i == 0) {
+                is_prime = false;
+                break;
+            }
+        }
+        if (is_prime == true) {
+            return n;
+        } else {
+            n++;
+        }
+    }
+}
+
+static u32 cfg_hash(u32 addr)
+{
+    return addr % cfg_hash_size;
+}
+
+static void cfg_insert_node(u32 addr, u32 s_size, u32 p_size)
+{
+    u32 hash = cfg_hash(addr);
+
+    while(cfg_nodes[hash].mapped == true){
+        hash = (hash + 1) % cfg_hash_size;
+    }
+
+    cfg_nodes[hash].mapped  = true;
+    cfg_nodes[hash].addr = addr;
+    cfg_nodes[hash].s_size = s_size;
+    cfg_nodes[hash].p_size = p_size;
+    cfg_nodes[hash].depth = -1;
+    cfg_nodes[hash].successors = malloc(s_size * sizeof(struct cfg_node *));
+    cfg_nodes[hash].predecessors = malloc(p_size * sizeof(struct cfg_node *));
+}
+
+static struct cfg_node *cfg_find_node(u32 addr)
+{
+    u32 old_hash, hash;
+    old_hash = hash = cfg_hash(addr);
+
+    if (cfg_nodes[hash].mapped == false) {
+        return NULL;
+    }
+
+    while(cfg_nodes[hash].addr != addr) {
+        hash = (hash + 1) % cfg_hash_size;
+
+        if (cfg_nodes[hash].mapped == false
+            || hash == old_hash) {
+            return NULL;
+        }
+    }
+
+    return &cfg_nodes[hash];
+}
+
+static struct cfg_node *cfg_init_hash_table(int n)
+{
+    struct cfg_node *res;
+
+    /* hash table size at least twice of nodes num */
+    cfg_hash_size = cfg_find_prime(2 * n);
+
+    res = (struct cfg_node *)malloc(sizeof(struct cfg_node) * cfg_hash_size);
+
+    memset(res, 0, sizeof(struct cfg_node) * cfg_hash_size);
+
+    return res;
 }
 
 /* @afl-cfg: load cfg's nodes to cfg_nodes[].
@@ -8132,20 +8195,12 @@ static int load_cfg_nodes()
     }
     cfg_nodes_cnt = i;
 
-    cfg_nodes = (struct cfg_node *)malloc(sizeof(struct cfg_node)
-            * cfg_nodes_cnt);
-    memset(cfg_nodes, 0, sizeof(struct cfg_node) * cfg_nodes_cnt);
+    cfg_nodes = cfg_init_hash_table(cfg_nodes_cnt);
+
 
     for (i = 0; i < cfg_nodes_cnt; i++) {
-        cfg_nodes[i].addr = addrs[i];
-        cfg_nodes[i].s_size = s_cnt[i];
-        cfg_nodes[i].p_size = p_cnt[i];
-        cfg_nodes[i].depth = -1;
-        cfg_nodes[i].successors = malloc(s_cnt[i] * sizeof(struct cfg_node *));
-        cfg_nodes[i].predecessors = malloc(p_cnt[i] * sizeof(struct cfg_node *));
+        cfg_insert_node(addrs[i], s_cnt[i], p_cnt[i]);
     }
-
-    qsort(cfg_nodes, cfg_nodes_cnt, sizeof(struct cfg_node), compare_cfg_node);
 
     fseek(fp, 0, SEEK_SET);
 
@@ -8158,7 +8213,7 @@ static int load_cfg_nodes()
             PFATAL("build cfg node list failed when read file");
             return -1;
         }
-        node = binary_search_cfg_node(addrs[i]);
+        node = cfg_find_node(addrs[i]);
         if (node == NULL) {
             PFATAL("build cfg node list failed when searching node %x",
                     addrs[i]);
@@ -8180,7 +8235,7 @@ static int load_cfg_nodes()
                 PFATAL("build cfg node list failed when read file");
                 return -1;
             }
-            succ = binary_search_cfg_node(s_addr);
+            succ = cfg_find_node(s_addr);
 
             if (succ == NULL) {
                 PFATAL("build cfg node list failed when searching node %x",
@@ -8210,7 +8265,7 @@ static int load_cfg_nodes()
                 PFATAL("build cfg node list failed when read file");
                 return -1;
             }
-            prede = binary_search_cfg_node(p_addr);
+            prede = cfg_find_node(p_addr);
 
             if (prede == NULL) {
                 PFATAL("build cfg node list failed when searching node %x",
@@ -8302,8 +8357,8 @@ static int load_cfg_edges()
 
         cfg_edges[edge_loc].marked = true;
         cfg_edges[edge_loc].jk = jk;
-        cfg_edges[edge_loc].cur_node = binary_search_cfg_node(cur_addr);
-        cfg_edges[edge_loc].next_node = binary_search_cfg_node(next_addr);
+        cfg_edges[edge_loc].cur_node = cfg_find_node(cur_addr);
+        cfg_edges[edge_loc].next_node = cfg_find_node(next_addr);
         if (cfg_edges[edge_loc].cur_node == NULL
                 || cfg_edges[edge_loc].next_node == NULL) {
             PFATAL("search edge %x->%x faild!", cur_addr, next_addr);
@@ -8314,18 +8369,44 @@ static int load_cfg_edges()
     return 0;
 }
 
+/* @afl-cfg: Calculate node's covered blocks,
+ * deep first search until level = 0.
+ * use s->covered flag to avoid double-count,
+ * so should use cfg_clear_covered_flag_down() after this. */
 static u32 cfg_cal_covered_block(struct cfg_node *p, int l)
 {
     u32 i;
     int ret = 0;
     for (i = 0; i < p->s_size; i++) {
         struct cfg_node *s = p->successors[i];
+        if (s->covered == true) {
+            continue;
+        }
         ret++;
+        s->covered = true;
         if (l > 0) {
             ret += cfg_cal_covered_block(s, l - 1);
         }
     }
     return ret;
+}
+
+/* @afl-cfg: pair function of cfg_cal_covered_block */
+static void cfg_clear_covered_flag_down(struct cfg_node *p, int l)
+{
+    u32 i;
+
+    for (i = 0; i < p->s_size; i++) {
+        struct cfg_node *s = p->successors[i];
+        if (s->covered == false) {
+            continue;
+        }
+
+        s->covered = false;
+        if (l > 0) {
+            cfg_clear_covered_flag_down(s, l - 1);
+        }
+    }
 }
 
 static int cfg_set_node_depth(struct cfg_node *s)
@@ -8352,12 +8433,20 @@ static void cfg_nodes_init()
 {
     int i = 0;
 
-    for(i = 0; i < cfg_nodes_cnt; i++) {
-        cfg_nodes[i].covered_blocks = cfg_cal_covered_block(&cfg_nodes[i], CFG_BLOCK_LEVEL - 1);
+    for(i = 0; i < cfg_hash_size; i++) {
+        if (cfg_nodes[i].mapped == true) {
+            cfg_nodes[i].covered = true;
+            cfg_nodes[i].covered_blocks =
+                cfg_cal_covered_block(&cfg_nodes[i], CFG_BLOCK_LEVEL - 1);
+
+            cfg_nodes[i].covered = false;
+            cfg_clear_covered_flag_down(&cfg_nodes[i], CFG_BLOCK_LEVEL - 1);
+        }
     }
 
-    for (i = 0; i < cfg_nodes_cnt; i++) {
-        cfg_set_node_depth(&cfg_nodes[i]);
+    for (i = 0; i < cfg_hash_size; i++) {
+        if (cfg_nodes[i].mapped == true)
+            cfg_set_node_depth(&cfg_nodes[i]);
     }
 }
 
