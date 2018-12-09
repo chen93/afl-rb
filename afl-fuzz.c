@@ -53,7 +53,6 @@
 #include <stdarg.h>
 #include <limits.h>
 
-
 #include <sys/wait.h>
 #include <sys/time.h>
 #include <sys/shm.h>
@@ -319,6 +318,7 @@ static int trim_for_branch = 0;
 /* @afl-cfg: control flow graph node information */
 struct cfg_node {
     u32 addr;
+    int depth;
 
     bool visited;
     u32 covered_blocks;
@@ -334,6 +334,7 @@ struct cfg_node {
 
 int cfg_nodes_cnt = 0;
 static struct cfg_node *cfg_nodes;
+#define CFG_BLOCK_LEVEL     5
 
 /* @afl-cfg: control flow graph edge information */
 enum JumpKind {
@@ -459,6 +460,31 @@ static void dump_to_logs() {
   ck_write(branch_hit_fd, hit_bits, sizeof(u64) * MAP_SIZE, fn);
   ck_free(fn);
   close(branch_hit_fd);
+}
+
+static void cfg_update_predecessors_nodes(struct cfg_node *s, int l)
+{
+    u32 i;
+    for (i = 0; i < s->p_size; i++) {
+        struct cfg_node *p = s->predecessors[i];
+        p->covered_blocks--;
+        if (l > 0) {
+            cfg_update_predecessors_nodes(p, l - 1);
+        }
+    }
+}
+
+static void update_cfg_nodes(u32 idx) {
+    if (cfg_edges[idx].marked) {
+        if (cfg_edges[idx].cur_node->visited == false) {
+            cfg_edges[idx].cur_node->visited = true;
+            cfg_update_predecessors_nodes(cfg_edges[idx].cur_node, CFG_BLOCK_LEVEL - 1);
+        }
+        if (cfg_edges[idx].next_node->visited == false) {
+            cfg_edges[idx].next_node->visited = true;
+            cfg_update_predecessors_nodes(cfg_edges[idx].next_node, CFG_BLOCK_LEVEL - 1);
+        }
+    }
 }
 
 /* Get unix time in milliseconds */
@@ -1289,17 +1315,30 @@ static inline u8 has_new_bits(u8* virgin_map) {
         if ((cur[0] && vir[0] == 0xff) || (cur[1] && vir[1] == 0xff) ||
             (cur[2] && vir[2] == 0xff) || (cur[3] && vir[3] == 0xff) ||
             (cur[4] && vir[4] == 0xff) || (cur[5] && vir[5] == 0xff) ||
-            (cur[6] && vir[6] == 0xff) || (cur[7] && vir[7] == 0xff)) ret = 2;
-        else ret = 1;
+            (cur[6] && vir[6] == 0xff) || (cur[7] && vir[7] == 0xff)) {
+            int j;
+            ret = 2;
+            for (j = 0; j < 8; j++) {
+                if (cur[i] && vir[j] == 0xff) {
+                    update_cfg_nodes(((MAP_SIZE >> 3) - i - 1) * 8 + j);
+                }
+            }
+        } else ret = 1;
 
 #else
 
         if ((cur[0] && vir[0] == 0xff) || (cur[1] && vir[1] == 0xff) ||
-            (cur[2] && vir[2] == 0xff) || (cur[3] && vir[3] == 0xff)) ret = 2;
-        else ret = 1;
+            (cur[2] && vir[2] == 0xff) || (cur[3] && vir[3] == 0xff)) {
+            int j;
+            ret = 2;
+            for (j = 0; j < 4; j++) {
+                if (cur[i] && vir[j] == 0xff) {
+                    update_cfg_nodes(((MAP_SIZE >> 2) - i - 1) * 4 + j);
+                }
+            }
+        } else ret = 1;
 
 #endif /* ^__x86_64__ */
-
       }
 
       *virgin &= ~*current;
@@ -8101,6 +8140,7 @@ static int load_cfg_nodes()
         cfg_nodes[i].addr = addrs[i];
         cfg_nodes[i].s_size = s_cnt[i];
         cfg_nodes[i].p_size = p_cnt[i];
+        cfg_nodes[i].depth = -1;
         cfg_nodes[i].successors = malloc(s_cnt[i] * sizeof(struct cfg_node *));
         cfg_nodes[i].predecessors = malloc(p_cnt[i] * sizeof(struct cfg_node *));
     }
@@ -8212,7 +8252,7 @@ static int load_cfg_edges()
         char *str;
         u32 cur_addr, next_addr;
         u32 cur_loc, next_loc, edge_loc;
-        enum JumpKind jk;
+        enum JumpKind jk = Ijk_Boring;
 
         if (fgets(line, 256, fp) == NULL) {
             if (feof(fp)) {
@@ -8272,6 +8312,53 @@ static int load_cfg_edges()
     }
     fclose(fp);
     return 0;
+}
+
+static u32 cfg_cal_covered_block(struct cfg_node *p, int l)
+{
+    u32 i;
+    int ret = 0;
+    for (i = 0; i < p->s_size; i++) {
+        struct cfg_node *s = p->successors[i];
+        ret++;
+        if (l > 0) {
+            ret += cfg_cal_covered_block(s, l - 1);
+        }
+    }
+    return ret;
+}
+
+static int cfg_set_node_depth(struct cfg_node *s)
+{
+    int min_pred_depth = 0x7fffffff;
+    u32 i;
+
+    if (s->depth != -1) {
+        return s->depth;
+    }
+
+    for (i = 0; i < s->p_size; i++) {
+        min_pred_depth = MIN(min_pred_depth, cfg_set_node_depth(s->predecessors[i]));
+    }
+    if (min_pred_depth != 0x7fffffff)
+        s->depth = min_pred_depth + 1;
+    else
+        s->depth = 0;
+
+    return s->depth;
+}
+
+static void cfg_nodes_init()
+{
+    int i = 0;
+
+    for(i = 0; i < cfg_nodes_cnt; i++) {
+        cfg_nodes[i].covered_blocks = cfg_cal_covered_block(&cfg_nodes[i], CFG_BLOCK_LEVEL - 1);
+    }
+
+    for (i = 0; i < cfg_nodes_cnt; i++) {
+        cfg_set_node_depth(&cfg_nodes[i]);
+    }
 }
 
 /* Trim and possibly create a banner for the run. */
@@ -9319,6 +9406,8 @@ int main(int argc, char** argv) {
   if (load_cfg_edges() == -1) {
     return -1;
   }
+
+  cfg_nodes_init();
 
   start_time = get_cur_time();
 
