@@ -466,18 +466,365 @@ static void dump_to_logs() {
   close(branch_hit_fd);
 }
 
-static void cfg_update_predecessors_nodes(struct cfg_node *s, int l)
+/* @afl-cfg */
+static u32 cfg_get_node_addr(char *str)
+{
+   char *p_end = str + strlen("node: ");
+   return strtol(p_end, &p_end, 16);
+}
+
+static int cfg_find_prime(int n)
+{
+    while(1) {
+        int i;
+        bool is_prime = true;
+        for (i = 2; i <= n/2; i++) {
+            if (n % i == 0) {
+                is_prime = false;
+                break;
+            }
+        }
+        if (is_prime == true) {
+            return n;
+        } else {
+            n++;
+        }
+    }
+}
+
+static u32 cfg_hash(u32 addr)
+{
+    return addr % cfg_hash_size;
+}
+
+static void cfg_insert_node(u32 addr, u32 s_size, u32 p_size)
+{
+    u32 hash = cfg_hash(addr);
+
+    while(cfg_nodes[hash].mapped == true){
+        hash = (hash + 1) % cfg_hash_size;
+    }
+
+    cfg_nodes[hash].mapped  = true;
+    cfg_nodes[hash].addr = addr;
+    cfg_nodes[hash].s_size = s_size;
+    cfg_nodes[hash].p_size = p_size;
+    cfg_nodes[hash].depth = -1;
+    cfg_nodes[hash].successors = malloc(s_size * sizeof(struct cfg_node *));
+    cfg_nodes[hash].predecessors = malloc(p_size * sizeof(struct cfg_node *));
+}
+
+static struct cfg_node *cfg_find_node(u32 addr)
+{
+    u32 old_hash, hash;
+    old_hash = hash = cfg_hash(addr);
+
+    if (cfg_nodes[hash].mapped == false) {
+        return NULL;
+    }
+
+    while(cfg_nodes[hash].addr != addr) {
+        hash = (hash + 1) % cfg_hash_size;
+
+        if (cfg_nodes[hash].mapped == false
+            || hash == old_hash) {
+            return NULL;
+        }
+    }
+
+    return &cfg_nodes[hash];
+}
+
+static struct cfg_node *cfg_init_hash_table(int n)
+{
+    struct cfg_node *res;
+
+    /* hash table size at least twice of nodes num */
+    cfg_hash_size = cfg_find_prime(2 * n);
+
+    res = (struct cfg_node *)malloc(sizeof(struct cfg_node) * cfg_hash_size);
+
+    memset(res, 0, sizeof(struct cfg_node) * cfg_hash_size);
+
+    return res;
+}
+
+/* @afl-cfg: load cfg's nodes to cfg_nodes[].
+ * scan twice of the file "nodes.txt" to load the info.
+ * node info will put into the global array cfg_nodes[].
+ * return: 0 if success, -1 if failed */
+static int load_cfg_nodes()
+{
+    FILE *fp;
+    char line[1024];
+    u32 *addrs, *s_cnt, *p_cnt;
+    u32 size, i = 0;
+    int ret;
+
+    /* open nodes.txt */
+    fp = fopen("nodes.txt", "r");
+    if (!fp) {
+        PFATAL("Unable to open nodes.txt");
+        return -1;
+    }
+
+    /* cnt the nodes and get node's addr into array */
+    addrs = malloc(sizeof(u32) * 100);
+    s_cnt = malloc(sizeof(u32) * 100);
+    p_cnt = malloc(sizeof(u32) * 100);
+    size = 100;
+    while (!feof(fp)) {
+        int len = 0;
+
+        if (i == size) {
+            addrs = realloc(addrs, (size + 100) * sizeof(u32));
+            s_cnt = realloc(s_cnt, (size + 100) * sizeof(u32));
+            p_cnt = realloc(p_cnt, (size + 100) * sizeof(u32));
+            size += 100;
+        }
+
+        if (fgets(line, 1024, fp) == NULL) {
+            if (feof(fp)) {
+                break;
+            }
+            PFATAL("build cfg node list failed when read file");
+            return -1;
+        }
+        addrs[i] = cfg_get_node_addr(line);
+
+        do {
+            if (fgets(line, 1024, fp) == NULL) {
+                PFATAL("build cfg node list failed when read file");
+                return -1;
+            }
+            len += strlen(line);
+        } while (strlen(line) == 1023 && line[1022] != '\n');
+        s_cnt[i] = (len - strlen("    successores:")) / 9;
+
+        len = 0;
+        do {
+            if (fgets(line, 1024, fp) == NULL) {
+                PFATAL("build cfg node list failed when read file");
+                return -1;
+            }
+            len += strlen(line);
+        } while (strlen(line) == 1023 && line[1022] != '\n');
+        p_cnt[i] = (len - strlen("    predecessores:")) / 9;
+
+        i++;
+    }
+    cfg_nodes_cnt = i;
+
+    cfg_nodes = cfg_init_hash_table(cfg_nodes_cnt);
+
+
+    for (i = 0; i < cfg_nodes_cnt; i++) {
+        cfg_insert_node(addrs[i], s_cnt[i], p_cnt[i]);
+    }
+
+    fseek(fp, 0, SEEK_SET);
+
+    for (i = 0; i < cfg_nodes_cnt; i++) {
+        int j;
+        struct cfg_node *node;
+
+        /* passby node: XXXX */
+        if (fgets(line, 1024, fp) == NULL) {
+            PFATAL("build cfg node list failed when read file");
+            return -1;
+        }
+        node = cfg_find_node(addrs[i]);
+        if (node == NULL) {
+            PFATAL("build cfg node list failed when searching node %x",
+                    addrs[i]);
+            return -1;
+        }
+
+        /* passby str "successors:" */
+        ret = fscanf(fp, "%s:", line);
+        if (ret == -1) {
+            PFATAL("build cfg node list failed when read file");
+            return -1;
+        }
+        for (j = 0; j < s_cnt[i]; j++) {
+            u32 s_addr;
+            struct cfg_node *succ;
+
+            ret = fscanf(fp, "%x", &s_addr);
+            if (ret == -1) {
+                PFATAL("build cfg node list failed when read file");
+                return -1;
+            }
+            succ = cfg_find_node(s_addr);
+
+            if (succ == NULL) {
+                PFATAL("build cfg node list failed when searching node %x",
+                        s_addr);
+                return -1;
+            }
+            node->successors[j] = succ;
+        }
+        /* passby " \n" */
+        if (fgets(line, 1024, fp) == NULL) {
+            PFATAL("build cfg node list failed when read file");
+            return -1;
+        }
+
+        /* passby str "predecessors:" */
+        ret = fscanf(fp, "%s:", line);
+        if (ret == -1) {
+            PFATAL("build cfg node list failed when read file");
+            return -1;
+        }
+        for (j = 0; j < p_cnt[i]; j++) {
+            u32 p_addr;
+            struct cfg_node *prede;
+
+            ret = fscanf(fp, "%x", &p_addr);
+            if (ret == -1) {
+                PFATAL("build cfg node list failed when read file");
+                return -1;
+            }
+            prede = cfg_find_node(p_addr);
+
+            if (prede == NULL) {
+                PFATAL("build cfg node list failed when searching node %x",
+                        p_addr);
+                return -1;
+            }
+            node->predecessors[j] = prede;
+        }
+        /* passby " \n" */
+        if (fgets(line, 1024, fp) == NULL) {
+            PFATAL("build cfg node list failed when read file");
+            return -1;
+        }
+    }
+    fclose(fp);
+    free(addrs);
+    free(s_cnt);
+    free(p_cnt);
+    return 0;
+}
+
+/* @afl-cfg: load cfg's edges to cfg_edges[].
+ * scan the file "edges.txt" to load the info
+ * into the global array cfg_edges[].
+ * return: 0 if success, -1 if failed */
+static int load_cfg_edges()
+{
+    FILE *fp;
+    char line[256];
+
+    /* open edges.txt */
+    fp = fopen("edges.txt", "r");
+    if (!fp) {
+        PFATAL("Unable to open edges.txt");
+        return -1;
+    }
+
+    while(!feof(fp)) {
+        char *str;
+        u32 cur_addr, next_addr;
+        u32 cur_loc, next_loc, edge_loc;
+        enum JumpKind jk = Ijk_Boring;
+
+        if (fgets(line, 256, fp) == NULL) {
+            if (feof(fp)) {
+                break;
+            }
+            PFATAL("build cfg edge list failed when read file");
+            return -1;
+        }
+        str = line;
+        str += strlen("cur: ");
+        cur_addr = strtol(str, &str, 16);
+        str += 2;
+        str += strlen("next: ");
+        next_addr = strtol(str, &str, 16);
+        str += 2;
+        str += strlen("jumpkind: ");
+
+        /* get edge jumpkind, if fakeret, ignore */
+        if (strncmp(str, "Ijk_FakeRet", strlen("Ijk_FakeRet")) == 0) {
+            break;
+        } else if (strncmp(str, "Ijk_Boring", strlen("Ijk_Boring")) == 0) {
+            jk = Ijk_Boring;
+        } else if (strncmp(str, "Ijk_Call", strlen("Ijk_Call")) == 0) {
+            jk = Ijk_Call;
+        } else if (strncmp(str, "Ijk_Ret", strlen("Ijk_Ret")) == 0) {
+            jk = Ijk_Ret;
+        }
+
+        cur_loc = (cur_addr >> 4) ^ (cur_addr << 8);
+        cur_loc &= (MAP_SIZE - 1);
+        cur_loc = cur_loc >> 1;
+
+        next_loc = (next_addr >> 4) ^ (next_addr << 8);
+        next_loc &= (MAP_SIZE - 1);
+
+        edge_loc = cur_loc ^ next_loc;
+
+        /* if crashed, only record the first edge */
+        if (cfg_edges[edge_loc].marked) {
+            if (cfg_edges[edge_loc].cur_node->addr != cur_addr
+                || cfg_edges[edge_loc].next_node->addr != next_addr) {
+                cfg_edges[edge_loc].crash = true;
+            } else {
+                continue;
+            }
+        }
+
+        cfg_edges[edge_loc].marked = true;
+        cfg_edges[edge_loc].jk = jk;
+        cfg_edges[edge_loc].cur_node = cfg_find_node(cur_addr);
+        cfg_edges[edge_loc].next_node = cfg_find_node(next_addr);
+        if (cfg_edges[edge_loc].cur_node == NULL
+                || cfg_edges[edge_loc].next_node == NULL) {
+            PFATAL("search edge %x->%x faild!", cur_addr, next_addr);
+            return -1;
+        }
+    }
+    fclose(fp);
+    return 0;
+}
+
+/* @afl-cfg: Calculate node's covered blocks,
+ * deep first search until level = 0.
+ * use s->covered flag to avoid double-count,
+ * so should use cfg_clear_covered_flag_down() after this. */
+static u32 cfg_cal_covered_block(struct cfg_node *p, int l)
 {
     u32 i;
-    for (i = 0; i < s->p_size; i++) {
-        struct cfg_node *p = s->predecessors[i];
-        if (p->covered == true) {
+    int ret = 0;
+    for (i = 0; i < p->s_size; i++) {
+        struct cfg_node *s = p->successors[i];
+        if (s->covered == true) {
             continue;
         }
-        p->covered_blocks--;
-        p->covered = true;
+        ret++;
+        s->covered = true;
         if (l > 0) {
-            cfg_update_predecessors_nodes(p, l - 1);
+            ret += cfg_cal_covered_block(s, l - 1);
+        }
+    }
+    return ret;
+}
+
+/* @afl-cfg: pair function of cfg_cal_covered_block */
+static void cfg_clear_covered_flag_down(struct cfg_node *p, int l)
+{
+    u32 i;
+
+    for (i = 0; i < p->s_size; i++) {
+        struct cfg_node *s = p->successors[i];
+        if (s->covered == false) {
+            continue;
+        }
+
+        s->covered = false;
+        if (l > 0) {
+            cfg_clear_covered_flag_down(s, l - 1);
         }
     }
 }
@@ -499,8 +846,64 @@ static void cfg_clear_covered_flag_up(struct cfg_node *s, int l)
     }
 }
 
+static int cfg_set_node_depth(struct cfg_node *s)
+{
+    int min_pred_depth = 0x7fffffff;
+    u32 i;
 
-static void update_cfg_nodes(u32 idx) {
+    if (s->depth != -1) {
+        return s->depth;
+    }
+
+    for (i = 0; i < s->p_size; i++) {
+        min_pred_depth = MIN(min_pred_depth, cfg_set_node_depth(s->predecessors[i]));
+    }
+    if (min_pred_depth != 0x7fffffff)
+        s->depth = min_pred_depth + 1;
+    else
+        s->depth = 0;
+
+    return s->depth;
+}
+
+static void cfg_nodes_init()
+{
+    int i = 0;
+
+    for(i = 0; i < cfg_hash_size; i++) {
+        if (cfg_nodes[i].mapped == true) {
+            cfg_nodes[i].covered = true;
+            cfg_nodes[i].covered_blocks =
+                cfg_cal_covered_block(&cfg_nodes[i], CFG_BLOCK_LEVEL - 1);
+
+            cfg_nodes[i].covered = false;
+            cfg_clear_covered_flag_down(&cfg_nodes[i], CFG_BLOCK_LEVEL - 1);
+        }
+    }
+
+    for (i = 0; i < cfg_hash_size; i++) {
+        if (cfg_nodes[i].mapped == true)
+            cfg_set_node_depth(&cfg_nodes[i]);
+    }
+}
+
+static void cfg_update_predecessors_nodes(struct cfg_node *s, int l)
+{
+    u32 i;
+    for (i = 0; i < s->p_size; i++) {
+        struct cfg_node *p = s->predecessors[i];
+        if (p->covered == true) {
+            continue;
+        }
+        p->covered_blocks--;
+        p->covered = true;
+        if (l > 0) {
+            cfg_update_predecessors_nodes(p, l - 1);
+        }
+    }
+}
+
+static void cfg_update_nodes(u32 idx) {
     if (cfg_edges[idx].marked) {
         if (cfg_edges[idx].cur_node->visited == false) {
             cfg_edges[idx].cur_node->visited = true;
@@ -1352,7 +1755,7 @@ static inline u8 has_new_bits(u8* virgin_map) {
             ret = 2;
             for (j = 0; j < 8; j++) {
                 if (cur[i] && vir[j] == 0xff) {
-                    update_cfg_nodes(((MAP_SIZE >> 3) - i - 1) * 8 + j);
+                    cfg_update_nodes(((MAP_SIZE >> 3) - i - 1) * 8 + j);
                 }
             }
         } else ret = 1;
@@ -1365,7 +1768,7 @@ static inline u8 has_new_bits(u8* virgin_map) {
             ret = 2;
             for (j = 0; j < 4; j++) {
                 if (cur[i] && vir[j] == 0xff) {
-                    update_cfg_nodes(((MAP_SIZE >> 2) - i - 1) * 4 + j);
+                    cfg_update_nodes(((MAP_SIZE >> 2) - i - 1) * 4 + j);
                 }
             }
         } else ret = 1;
@@ -7693,13 +8096,11 @@ abandon_entry:
   ck_free(branch_mask);
   ck_free(orig_branch_mask);
 
-
   return ret_val;
 
 #undef FLIP_BIT
 
 }
-
 
 /* Grab interesting test cases from other fuzzers. */
 
@@ -8046,409 +8447,6 @@ EXP_ST void check_binary(u8* fname) {
 
 }
 
-/* @afl-cfg */
-static u32 get_cfg_node_addr(char *str)
-{
-   char *p_end = str + strlen("node: ");
-   return strtol(p_end, &p_end, 16);
-}
-
-static int cfg_find_prime(int n)
-{
-    while(1) {
-        int i;
-        bool is_prime = true;
-        for (i = 2; i <= n/2; i++) {
-            if (n % i == 0) {
-                is_prime = false;
-                break;
-            }
-        }
-        if (is_prime == true) {
-            return n;
-        } else {
-            n++;
-        }
-    }
-}
-
-static u32 cfg_hash(u32 addr)
-{
-    return addr % cfg_hash_size;
-}
-
-static void cfg_insert_node(u32 addr, u32 s_size, u32 p_size)
-{
-    u32 hash = cfg_hash(addr);
-
-    while(cfg_nodes[hash].mapped == true){
-        hash = (hash + 1) % cfg_hash_size;
-    }
-
-    cfg_nodes[hash].mapped  = true;
-    cfg_nodes[hash].addr = addr;
-    cfg_nodes[hash].s_size = s_size;
-    cfg_nodes[hash].p_size = p_size;
-    cfg_nodes[hash].depth = -1;
-    cfg_nodes[hash].successors = malloc(s_size * sizeof(struct cfg_node *));
-    cfg_nodes[hash].predecessors = malloc(p_size * sizeof(struct cfg_node *));
-}
-
-static struct cfg_node *cfg_find_node(u32 addr)
-{
-    u32 old_hash, hash;
-    old_hash = hash = cfg_hash(addr);
-
-    if (cfg_nodes[hash].mapped == false) {
-        return NULL;
-    }
-
-    while(cfg_nodes[hash].addr != addr) {
-        hash = (hash + 1) % cfg_hash_size;
-
-        if (cfg_nodes[hash].mapped == false
-            || hash == old_hash) {
-            return NULL;
-        }
-    }
-
-    return &cfg_nodes[hash];
-}
-
-static struct cfg_node *cfg_init_hash_table(int n)
-{
-    struct cfg_node *res;
-
-    /* hash table size at least twice of nodes num */
-    cfg_hash_size = cfg_find_prime(2 * n);
-
-    res = (struct cfg_node *)malloc(sizeof(struct cfg_node) * cfg_hash_size);
-
-    memset(res, 0, sizeof(struct cfg_node) * cfg_hash_size);
-
-    return res;
-}
-
-/* @afl-cfg: load cfg's nodes to cfg_nodes[].
- * scan twice of the file "nodes.txt" to load the info.
- * node info will put into the global array cfg_nodes[].
- * return: 0 if success, -1 if failed */
-static int load_cfg_nodes()
-{
-    FILE *fp;
-    char line[1024];
-    u32 *addrs, *s_cnt, *p_cnt;
-    u32 size, i = 0;
-    int ret;
-
-    /* open nodes.txt */
-    fp = fopen("nodes.txt", "r");
-    if (!fp) {
-        PFATAL("Unable to open nodes.txt");
-        return -1;
-    }
-
-    /* cnt the nodes and get node's addr into array */
-    addrs = malloc(sizeof(u32) * 100);
-    s_cnt = malloc(sizeof(u32) * 100);
-    p_cnt = malloc(sizeof(u32) * 100);
-    size = 100;
-    while (!feof(fp)) {
-        int len = 0;
-
-        if (i == size) {
-            addrs = realloc(addrs, (size + 100) * sizeof(u32));
-            s_cnt = realloc(s_cnt, (size + 100) * sizeof(u32));
-            p_cnt = realloc(p_cnt, (size + 100) * sizeof(u32));
-            size += 100;
-        }
-
-        if (fgets(line, 1024, fp) == NULL) {
-            if (feof(fp)) {
-                break;
-            }
-            PFATAL("build cfg node list failed when read file");
-            return -1;
-        }
-        addrs[i] = get_cfg_node_addr(line);
-
-        do {
-            if (fgets(line, 1024, fp) == NULL) {
-                PFATAL("build cfg node list failed when read file");
-                return -1;
-            }
-            len += strlen(line);
-        } while (strlen(line) == 1023 && line[1022] != '\n');
-        s_cnt[i] = (len - strlen("    successores:")) / 9;
-
-        len = 0;
-        do {
-            if (fgets(line, 1024, fp) == NULL) {
-                PFATAL("build cfg node list failed when read file");
-                return -1;
-            }
-            len += strlen(line);
-        } while (strlen(line) == 1023 && line[1022] != '\n');
-        p_cnt[i] = (len - strlen("    predecessores:")) / 9;
-
-        i++;
-    }
-    cfg_nodes_cnt = i;
-
-    cfg_nodes = cfg_init_hash_table(cfg_nodes_cnt);
-
-
-    for (i = 0; i < cfg_nodes_cnt; i++) {
-        cfg_insert_node(addrs[i], s_cnt[i], p_cnt[i]);
-    }
-
-    fseek(fp, 0, SEEK_SET);
-
-    for (i = 0; i < cfg_nodes_cnt; i++) {
-        int j;
-        struct cfg_node *node;
-
-        /* passby node: XXXX */
-        if (fgets(line, 1024, fp) == NULL) {
-            PFATAL("build cfg node list failed when read file");
-            return -1;
-        }
-        node = cfg_find_node(addrs[i]);
-        if (node == NULL) {
-            PFATAL("build cfg node list failed when searching node %x",
-                    addrs[i]);
-            return -1;
-        }
-
-        /* passby str "successors:" */
-        ret = fscanf(fp, "%s:", line);
-        if (ret == -1) {
-            PFATAL("build cfg node list failed when read file");
-            return -1;
-        }
-        for (j = 0; j < s_cnt[i]; j++) {
-            u32 s_addr;
-            struct cfg_node *succ;
-
-            ret = fscanf(fp, "%x", &s_addr);
-            if (ret == -1) {
-                PFATAL("build cfg node list failed when read file");
-                return -1;
-            }
-            succ = cfg_find_node(s_addr);
-
-            if (succ == NULL) {
-                PFATAL("build cfg node list failed when searching node %x",
-                        s_addr);
-                return -1;
-            }
-            node->successors[j] = succ;
-        }
-        /* passby " \n" */
-        if (fgets(line, 1024, fp) == NULL) {
-            PFATAL("build cfg node list failed when read file");
-            return -1;
-        }
-
-        /* passby str "predecessors:" */
-        ret = fscanf(fp, "%s:", line);
-        if (ret == -1) {
-            PFATAL("build cfg node list failed when read file");
-            return -1;
-        }
-        for (j = 0; j < p_cnt[i]; j++) {
-            u32 p_addr;
-            struct cfg_node *prede;
-
-            ret = fscanf(fp, "%x", &p_addr);
-            if (ret == -1) {
-                PFATAL("build cfg node list failed when read file");
-                return -1;
-            }
-            prede = cfg_find_node(p_addr);
-
-            if (prede == NULL) {
-                PFATAL("build cfg node list failed when searching node %x",
-                        p_addr);
-                return -1;
-            }
-            node->predecessors[j] = prede;
-        }
-        /* passby " \n" */
-        if (fgets(line, 1024, fp) == NULL) {
-            PFATAL("build cfg node list failed when read file");
-            return -1;
-        }
-    }
-    fclose(fp);
-    free(addrs);
-    free(s_cnt);
-    free(p_cnt);
-    return 0;
-}
-
-/* @afl-cfg: load cfg's edges to cfg_edges[].
- * scan the file "edges.txt" to load the info
- * into the global array cfg_edges[].
- * return: 0 if success, -1 if failed */
-static int load_cfg_edges()
-{
-    FILE *fp;
-    char line[256];
-
-    /* open edges.txt */
-    fp = fopen("edges.txt", "r");
-    if (!fp) {
-        PFATAL("Unable to open edges.txt");
-        return -1;
-    }
-
-    while(!feof(fp)) {
-        char *str;
-        u32 cur_addr, next_addr;
-        u32 cur_loc, next_loc, edge_loc;
-        enum JumpKind jk = Ijk_Boring;
-
-        if (fgets(line, 256, fp) == NULL) {
-            if (feof(fp)) {
-                break;
-            }
-            PFATAL("build cfg edge list failed when read file");
-            return -1;
-        }
-        str = line;
-        str += strlen("cur: ");
-        cur_addr = strtol(str, &str, 16);
-        str += 2;
-        str += strlen("next: ");
-        next_addr = strtol(str, &str, 16);
-        str += 2;
-        str += strlen("jumpkind: ");
-
-        /* get edge jumpkind, if fakeret, ignore */
-        if (strncmp(str, "Ijk_FakeRet", strlen("Ijk_FakeRet")) == 0) {
-            break;
-        } else if (strncmp(str, "Ijk_Boring", strlen("Ijk_Boring")) == 0) {
-            jk = Ijk_Boring;
-        } else if (strncmp(str, "Ijk_Call", strlen("Ijk_Call")) == 0) {
-            jk = Ijk_Call;
-        } else if (strncmp(str, "Ijk_Ret", strlen("Ijk_Ret")) == 0) {
-            jk = Ijk_Ret;
-        }
-
-        cur_loc = (cur_addr >> 4) ^ (cur_addr << 8);
-        cur_loc &= (MAP_SIZE - 1);
-        cur_loc = cur_loc >> 1;
-
-        next_loc = (next_addr >> 4) ^ (next_addr << 8);
-        next_loc &= (MAP_SIZE - 1);
-
-        edge_loc = cur_loc ^ next_loc;
-
-        /* if crashed, only record the first edge */
-        if (cfg_edges[edge_loc].marked) {
-            if (cfg_edges[edge_loc].cur_node->addr != cur_addr
-                || cfg_edges[edge_loc].next_node->addr != next_addr) {
-                cfg_edges[edge_loc].crash = true;
-            } else {
-                continue;
-            }
-        }
-
-        cfg_edges[edge_loc].marked = true;
-        cfg_edges[edge_loc].jk = jk;
-        cfg_edges[edge_loc].cur_node = cfg_find_node(cur_addr);
-        cfg_edges[edge_loc].next_node = cfg_find_node(next_addr);
-        if (cfg_edges[edge_loc].cur_node == NULL
-                || cfg_edges[edge_loc].next_node == NULL) {
-            PFATAL("search edge %x->%x faild!", cur_addr, next_addr);
-            return -1;
-        }
-    }
-    fclose(fp);
-    return 0;
-}
-
-/* @afl-cfg: Calculate node's covered blocks,
- * deep first search until level = 0.
- * use s->covered flag to avoid double-count,
- * so should use cfg_clear_covered_flag_down() after this. */
-static u32 cfg_cal_covered_block(struct cfg_node *p, int l)
-{
-    u32 i;
-    int ret = 0;
-    for (i = 0; i < p->s_size; i++) {
-        struct cfg_node *s = p->successors[i];
-        if (s->covered == true) {
-            continue;
-        }
-        ret++;
-        s->covered = true;
-        if (l > 0) {
-            ret += cfg_cal_covered_block(s, l - 1);
-        }
-    }
-    return ret;
-}
-
-/* @afl-cfg: pair function of cfg_cal_covered_block */
-static void cfg_clear_covered_flag_down(struct cfg_node *p, int l)
-{
-    u32 i;
-
-    for (i = 0; i < p->s_size; i++) {
-        struct cfg_node *s = p->successors[i];
-        if (s->covered == false) {
-            continue;
-        }
-
-        s->covered = false;
-        if (l > 0) {
-            cfg_clear_covered_flag_down(s, l - 1);
-        }
-    }
-}
-
-static int cfg_set_node_depth(struct cfg_node *s)
-{
-    int min_pred_depth = 0x7fffffff;
-    u32 i;
-
-    if (s->depth != -1) {
-        return s->depth;
-    }
-
-    for (i = 0; i < s->p_size; i++) {
-        min_pred_depth = MIN(min_pred_depth, cfg_set_node_depth(s->predecessors[i]));
-    }
-    if (min_pred_depth != 0x7fffffff)
-        s->depth = min_pred_depth + 1;
-    else
-        s->depth = 0;
-
-    return s->depth;
-}
-
-static void cfg_nodes_init()
-{
-    int i = 0;
-
-    for(i = 0; i < cfg_hash_size; i++) {
-        if (cfg_nodes[i].mapped == true) {
-            cfg_nodes[i].covered = true;
-            cfg_nodes[i].covered_blocks =
-                cfg_cal_covered_block(&cfg_nodes[i], CFG_BLOCK_LEVEL - 1);
-
-            cfg_nodes[i].covered = false;
-            cfg_clear_covered_flag_down(&cfg_nodes[i], CFG_BLOCK_LEVEL - 1);
-        }
-    }
-
-    for (i = 0; i < cfg_hash_size; i++) {
-        if (cfg_nodes[i].mapped == true)
-            cfg_set_node_depth(&cfg_nodes[i]);
-    }
-}
 
 /* Trim and possibly create a banner for the run. */
 
