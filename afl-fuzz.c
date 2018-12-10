@@ -256,6 +256,8 @@ struct queue_entry {
   u8* trace_mini;                     /* Trace bytes, if kept             */
   u32 tc_ref;                         /* Trace bytes ref count            */
 
+  u8* node_bits;                      /* hited nodes map                  */
+
   u8* fuzzed_branches;                /* @RB@ which branches have been done */
 
   struct queue_entry *next,           /* Next element, if any             */
@@ -514,13 +516,13 @@ static void cfg_insert_node(u32 addr, u32 s_size, u32 p_size)
     cfg_nodes[hash].predecessors = malloc(p_size * sizeof(struct cfg_node *));
 }
 
-static struct cfg_node *cfg_find_node(u32 addr)
+static int cfg_find_node_idx(u32 addr)
 {
     u32 old_hash, hash;
     old_hash = hash = cfg_hash(addr);
 
     if (cfg_nodes[hash].mapped == false) {
-        return NULL;
+        return -1;
     }
 
     while(cfg_nodes[hash].addr != addr) {
@@ -528,11 +530,22 @@ static struct cfg_node *cfg_find_node(u32 addr)
 
         if (cfg_nodes[hash].mapped == false
             || hash == old_hash) {
-            return NULL;
+            return -1;
         }
     }
 
-    return &cfg_nodes[hash];
+    return hash;
+}
+
+static struct cfg_node *cfg_find_node(u32 addr)
+{
+    int idx = cfg_find_node_idx(addr);
+
+    if (idx == -1) {
+        return NULL;
+    }
+
+    return &cfg_nodes[idx];
 }
 
 static struct cfg_node *cfg_init_hash_table(int n)
@@ -553,7 +566,7 @@ static struct cfg_node *cfg_init_hash_table(int n)
  * scan twice of the file "nodes.txt" to load the info.
  * node info will put into the global array cfg_nodes[].
  * return: 0 if success, -1 if failed */
-static int load_cfg_nodes()
+static int cfg_load_nodes()
 {
     FILE *fp;
     char line[1024];
@@ -711,7 +724,7 @@ static int load_cfg_nodes()
  * scan the file "edges.txt" to load the info
  * into the global array cfg_edges[].
  * return: 0 if success, -1 if failed */
-static int load_cfg_edges()
+static int cfg_load_edges()
 {
     FILE *fp;
     char line[256];
@@ -922,6 +935,34 @@ static void cfg_update_nodes(u32 idx) {
     }
 }
 
+static void cfg_generate_node_bits(u8* nodes_bits, u8* trace_bits)
+{
+    u32 i = 0;
+    while (i < MAP_SIZE) {
+        if (trace_bits[i] != 0) {
+            u32 idx;
+            struct cfg_edge *e = &cfg_edges[i];
+            struct cfg_node *cur, *next;
+
+            if (e->marked == false) {
+                /* TODO: edge is not record by angr cfg */
+                i++;
+                continue;
+            }
+
+            cur = e->cur_node;
+            next = e->next_node;
+
+            idx = cfg_find_node_idx(cur->addr);
+            nodes_bits[idx] = 1;
+
+            idx = cfg_find_node_idx(next->addr);
+            nodes_bits[idx] = 1;
+        }
+        i++;
+    }
+}
+
 /* Get unix time in milliseconds */
 
 static u64 get_cur_time(void) {
@@ -934,7 +975,6 @@ static u64 get_cur_time(void) {
   return (tv.tv_sec * 1000ULL) + (tv.tv_usec / 1000);
 
 }
-
 
 /* Get unix time in microseconds */
 
@@ -1608,6 +1648,10 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   // @RB@ added these for every queue entry
   q->trace_mini = ck_alloc(MAP_SIZE >> 3);
   minimize_bits(q->trace_mini, trace_bits);
+
+  q->node_bits = ck_alloc(cfg_hash_size);
+  cfg_generate_node_bits(q->node_bits, trace_bits);
+
   q->fuzzed_branches = ck_alloc(MAP_SIZE >>3);
   // @End
 
@@ -1652,6 +1696,7 @@ EXP_ST void destroy_queue(void) {
     n = q->next;
     ck_free(q->fname);
     ck_free(q->trace_mini);
+    ck_free(q->node_bits);
     ck_free(q->fuzzed_branches);
     ck_free(q);
     q = n;
@@ -2101,6 +2146,11 @@ static void update_bitmap_score(struct queue_entry* q) {
        if (!q->trace_mini) {
          q->trace_mini = ck_alloc(MAP_SIZE >> 3);
          minimize_bits(q->trace_mini, trace_bits);
+       }
+
+       if (!q->node_bits) {
+         q->node_bits = ck_alloc(cfg_hash_size);
+         cfg_generate_node_bits(q->node_bits, trace_bits);
        }
 
        score_changed = 1;
@@ -3557,9 +3607,14 @@ static void perform_dry_run(char** argv) {
     // @RB@ added these for every queue entry
     // free what was added in add_to_queue
     ck_free(q->trace_mini);
+    ck_free(q->node_bits);
     ck_free(q->fuzzed_branches);
     q->trace_mini = ck_alloc(MAP_SIZE >> 3);
     minimize_bits(q->trace_mini, trace_bits);
+
+    q->node_bits = ck_alloc(cfg_hash_size);
+    cfg_generate_node_bits(q->node_bits, trace_bits);
+
     q->fuzzed_branches = ck_alloc(MAP_SIZE >>3);
     // @End
 
@@ -9486,11 +9541,11 @@ int main(int argc, char** argv) {
 
   check_binary(argv[optind]);
 
-  if (load_cfg_nodes() == -1) {
+  if (cfg_load_nodes() == -1) {
     return -1;
   }
 
-  if (load_cfg_edges() == -1) {
+  if (cfg_load_edges() == -1) {
     return -1;
   }
 
