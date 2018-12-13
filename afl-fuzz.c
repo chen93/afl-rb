@@ -336,11 +336,17 @@ struct cfg_node {
 
     u32 p_size;             /* node's predecessors number */
     struct cfg_node **predecessors;
+
+    bool is_candidate;
+    struct cfg_node *next;  /* for candidate_nodes list */
+    struct cfg_node *prev;  /* for candidate_nodes list */
 };
 
 int cfg_nodes_cnt = 0;
 int cfg_hash_size = 0;
 static struct cfg_node *cfg_nodes;
+static struct cfg_node *candidate_nodes;
+static struct cfg_node *candidate_nodes_tail;
 
 /* @afl-cfg: control flow graph edge information */
 enum JumpKind {
@@ -735,7 +741,6 @@ static int cfg_load_edges()
         PFATAL("Unable to open edges.txt");
         return -1;
     }
-
     while(!feof(fp)) {
         char *str;
         u32 cur_addr, next_addr;
@@ -760,7 +765,7 @@ static int cfg_load_edges()
 
         /* get edge jumpkind, if fakeret, ignore */
         if (strncmp(str, "Ijk_FakeRet", strlen("Ijk_FakeRet")) == 0) {
-            break;
+            continue;
         } else if (strncmp(str, "Ijk_Boring", strlen("Ijk_Boring")) == 0) {
             jk = Ijk_Boring;
         } else if (strncmp(str, "Ijk_Call", strlen("Ijk_Call")) == 0) {
@@ -778,6 +783,7 @@ static int cfg_load_edges()
 
         edge_loc = cur_loc ^ next_loc;
 
+        //DEBUG1("edges: %x %x at position: %x\n", cur_addr, next_addr, edge_loc);
         /* if crashed, only record the first edge */
         if (cfg_edges[edge_loc].marked) {
             if (cfg_edges[edge_loc].cur_node->addr != cur_addr
@@ -798,6 +804,7 @@ static int cfg_load_edges()
             return -1;
         }
     }
+
     fclose(fp);
     return 0;
 }
@@ -900,6 +907,95 @@ static void cfg_nodes_init()
     }
 }
 
+/* append the node to candidate_nodes list tail */
+static void cfg_append_candidate_node(struct cfg_node *node)
+{
+    if (candidate_nodes_tail == NULL) {
+        candidate_nodes_tail = node;
+        candidate_nodes = node;
+        node->is_candidate = true;
+        return;
+    }
+
+    candidate_nodes_tail->next = node;
+    node->prev = candidate_nodes_tail;
+    candidate_nodes_tail = node;
+
+    node->is_candidate = true;
+}
+
+/* remove the node from candidate_nodes list */
+static void cfg_remove_candidate_node(struct cfg_node *node)
+{
+    if (node->is_candidate == false) {
+        return;
+    }
+
+    if (candidate_nodes == node) {
+        candidate_nodes = node->next;
+    }
+    if (candidate_nodes_tail == node) {
+        candidate_nodes_tail = node->prev;
+    }
+
+    if (node->next)
+        node->next->prev = node->prev;
+    if (node->prev)
+        node->prev->next = node->next;
+
+    node->next = NULL;
+    node->prev = NULL;
+
+    node->is_candidate = false;
+}
+
+/* check the node whether it can be candidate */
+static bool cfg_check_candidate(struct cfg_node *node)
+{
+    u32 i;
+    bool has_unvisited = false;
+
+    /* 1st: it should have been visited */
+    if (node->visited == false) {
+        return false;
+    }
+
+    /* 2nd: it has at least one node hasn't been visited */
+    for (i = 0; i < node->s_size; i++) {
+        struct cfg_node *s = node->successors[i];
+        if (s->visited == false) {
+            has_unvisited = true;
+            break;
+        }
+    }
+
+    return has_unvisited;
+}
+
+/* if is a new visited node, update the candidate_nodes list */
+static void cfg_update_candidate_nodes(struct cfg_node *node)
+{
+    u32 i;
+
+    /* check each predecessors */
+    for (i = 0; i < node->p_size; i++) {
+        struct cfg_node *p = node->predecessors[i];
+        if (p->is_candidate == true && p->visited == true) {
+            /* if predecessor is candidated,
+             * remove when no unvisited successors */
+            if (!cfg_check_candidate(p)) {
+                /* no unvisited successors for this node,
+                 * remove from candidate_nodes*/
+                cfg_remove_candidate_node(p);
+            }
+        }
+    }
+
+    if (cfg_check_candidate(node)) {
+        cfg_append_candidate_node(node);
+    }
+}
+
 static void cfg_update_predecessors_nodes(struct cfg_node *s, int l)
 {
     u32 i;
@@ -920,6 +1016,9 @@ static void cfg_update_nodes(u32 idx) {
     if (cfg_edges[idx].marked) {
         if (cfg_edges[idx].cur_node->visited == false) {
             cfg_edges[idx].cur_node->visited = true;
+
+            cfg_update_candidate_nodes(cfg_edges[idx].cur_node);
+
             cfg_edges[idx].cur_node->covered = true;
             cfg_update_predecessors_nodes(cfg_edges[idx].cur_node, CFG_BLOCK_LEVEL - 1);
             cfg_edges[idx].cur_node->covered = false;
@@ -927,6 +1026,9 @@ static void cfg_update_nodes(u32 idx) {
         }
         if (cfg_edges[idx].next_node->visited == false) {
             cfg_edges[idx].next_node->visited = true;
+
+            cfg_update_candidate_nodes(cfg_edges[idx].next_node);
+
             cfg_edges[idx].next_node->covered = true;
             cfg_update_predecessors_nodes(cfg_edges[idx].next_node, CFG_BLOCK_LEVEL - 1);
             cfg_edges[idx].next_node->covered = false;
@@ -962,6 +1064,7 @@ static void cfg_generate_node_bits(u8* nodes_bits, u8* trace_bits)
         i++;
     }
 }
+
 
 /* Get unix time in milliseconds */
 
@@ -1754,7 +1857,7 @@ EXP_ST void read_bitmap(u8* fname) {
    This function is called after every exec() on a fairly large buffer, so
    it needs to be fast. We do this in 32-bit and 64-bit flavors. */
 
-static inline u8 has_new_bits(u8* virgin_map) {
+static inline u8 has_new_bits(u8* virgin_map, bool need_update_candidate) {
 
 #ifdef __x86_64__
 
@@ -1782,7 +1885,7 @@ static inline u8 has_new_bits(u8* virgin_map) {
 
     if (unlikely(*current) && unlikely(*current & *virgin)) {
 
-      if (likely(ret < 2)) {
+//      if (likely(ret < 2)) {
 
         u8* cur = (u8*)current;
         u8* vir = (u8*)virgin;
@@ -1796,11 +1899,13 @@ static inline u8 has_new_bits(u8* virgin_map) {
             (cur[2] && vir[2] == 0xff) || (cur[3] && vir[3] == 0xff) ||
             (cur[4] && vir[4] == 0xff) || (cur[5] && vir[5] == 0xff) ||
             (cur[6] && vir[6] == 0xff) || (cur[7] && vir[7] == 0xff)) {
-            int j;
             ret = 2;
-            for (j = 0; j < 8; j++) {
-                if (cur[i] && vir[j] == 0xff) {
-                    cfg_update_nodes(((MAP_SIZE >> 3) - i - 1) * 8 + j);
+            if (need_update_candidate) {
+                int j;
+                for (j = 0; j < 8; j++) {
+                    if (cur[j] && vir[j] == 0xff) {
+                        cfg_update_nodes(((MAP_SIZE >> 3) - i - 1) * 8 + j);
+                    }
                 }
             }
         } else ret = 1;
@@ -1809,17 +1914,19 @@ static inline u8 has_new_bits(u8* virgin_map) {
 
         if ((cur[0] && vir[0] == 0xff) || (cur[1] && vir[1] == 0xff) ||
             (cur[2] && vir[2] == 0xff) || (cur[3] && vir[3] == 0xff)) {
-            int j;
             ret = 2;
-            for (j = 0; j < 4; j++) {
-                if (cur[i] && vir[j] == 0xff) {
-                    cfg_update_nodes(((MAP_SIZE >> 2) - i - 1) * 4 + j);
+            if (need_update_candidate) {
+                int j;
+                for (j = 0; j < 4; j++) {
+                    if (cur[j] && vir[j] == 0xff) {
+                        cfg_update_nodes(((MAP_SIZE >> 2) - i - 1) * 4 + j);
+                    }
                 }
             }
         } else ret = 1;
 
 #endif /* ^__x86_64__ */
-      }
+//      }
 
       *virgin &= ~*current;
 
@@ -3471,7 +3578,7 @@ static u8 calibrate_case(char** argv, struct queue_entry* q, u8* use_mem,
 
     if (q->exec_cksum != cksum) {
 
-      u8 hnb = has_new_bits(virgin_bits);
+      u8 hnb = has_new_bits(virgin_bits, true);
       if (hnb > new_bits) new_bits = hnb;
 
       if (q->exec_cksum) {
@@ -4038,7 +4145,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     /* Keep only if there are new bits in the map, add to queue for
        future fuzzing, etc. */
 
-    if (!(hnb = has_new_bits(virgin_bits))) {
+    if (!(hnb = has_new_bits(virgin_bits, true))) {
       if (crash_mode) total_crashes++;
       return 0;
     }   
@@ -4098,6 +4205,7 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
       if (unique_hangs >= KEEP_UNIQUE_HANG) return keeping;
 
       if (!dumb_mode) {
+        has_new_bits(virgin_bits, true);
 
 #ifdef __x86_64__
         simplify_trace((u64*)trace_bits);
@@ -4105,7 +4213,8 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
         simplify_trace((u32*)trace_bits);
 #endif /* ^__x86_64__ */
 
-        if (!has_new_bits(virgin_tmout)) return keeping;
+
+        if (!has_new_bits(virgin_tmout, false)) return keeping;
 
       }
 
@@ -4162,6 +4271,7 @@ keep_as_crash:
       if (unique_crashes >= KEEP_UNIQUE_CRASH) return keeping;
 
       if (!dumb_mode) {
+        has_new_bits(virgin_bits, true);
 
 #ifdef __x86_64__
         simplify_trace((u64*)trace_bits);
@@ -4169,7 +4279,8 @@ keep_as_crash:
         simplify_trace((u32*)trace_bits);
 #endif /* ^__x86_64__ */
 
-        if (!has_new_bits(virgin_crash)) return keeping;
+
+        if (!has_new_bits(virgin_crash, false)) return keeping;
 
       }
 
@@ -5494,7 +5605,6 @@ abort_trimming:
   return fault;
 
 }
-
 
 /* Write a modified test case, run program, process results. Handle
    error conditions, returning 1 if it's time to bail out. This is

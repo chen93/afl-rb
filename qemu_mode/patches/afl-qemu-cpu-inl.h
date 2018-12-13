@@ -230,6 +230,9 @@ static inline void afl_maybe_log(abi_ulong cur_loc) {
 
   static __thread abi_ulong prev_loc;
 
+#if 0
+  FILE *trace_log = NULL;
+#endif
   /* Optimize for cur_loc > afl_end_code, which is the most likely case on
      Linux systems. */
 
@@ -240,8 +243,17 @@ static inline void afl_maybe_log(abi_ulong cur_loc) {
      concern. Phew. But instruction addresses may be aligned. Let's mangle
      the value to get something quasi-uniform. */
 
+#if 0
+  trace_log = fopen("qemu_trace.log", "a+");
+  fprintf(trace_log, "addr: %8x prev_loc %4x ", cur_loc, prev_loc);
+#endif
   cur_loc  = (cur_loc >> 4) ^ (cur_loc << 8);
   cur_loc &= MAP_SIZE - 1;
+
+#if 0
+  fprintf(trace_log, "cur_loc %x idx %4x\n", cur_loc, cur_loc ^prev_loc);
+  fclose(trace_log);
+#endif
 
   /* Implement probabilistic instrumentation by looking at scrambled block
      address. This keeps the instrumented locations stable across runs. */
