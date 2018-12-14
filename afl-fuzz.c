@@ -342,8 +342,9 @@ struct cfg_node {
     struct cfg_node *prev;  /* for candidate_nodes list */
 };
 
-int cfg_nodes_cnt = 0;
-int cfg_hash_size = 0;
+static int cfg_nodes_cnt = 0;
+static int cfg_hash_size = 0;
+static int candidate_nodes_cnt = 0;
 static struct cfg_node *cfg_nodes;
 static struct cfg_node *candidate_nodes;
 
@@ -967,6 +968,7 @@ static void cfg_insert_candidate_node(struct cfg_node *node)
         cur->prev = node;
         node->next = cur;
     }
+    candidate_nodes_cnt++;
     node->is_candidate = true;
 }
 
@@ -1044,6 +1046,7 @@ static void cfg_remove_candidate_node(struct cfg_node *node)
     node->next = NULL;
     node->prev = NULL;
 
+    candidate_nodes_cnt--;
     node->is_candidate = false;
 }
 
