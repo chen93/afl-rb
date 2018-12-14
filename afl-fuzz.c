@@ -328,8 +328,8 @@ struct cfg_node {
     bool covered;           /* flag use to calculate covered blocks */
     u32 covered_blocks;     /* how many blocks is covered by this node,
                                only count CFG_BLOCK_LEVEL below */
-    u32 hits;
-    u32 scores;
+    u32 fuzz_cnt;
+    double score;
 
     u32 s_size;             /* node's successors number */
     struct cfg_node **successors;
@@ -346,7 +346,6 @@ int cfg_nodes_cnt = 0;
 int cfg_hash_size = 0;
 static struct cfg_node *cfg_nodes;
 static struct cfg_node *candidate_nodes;
-static struct cfg_node *candidate_nodes_tail;
 
 /* @afl-cfg: control flow graph edge information */
 enum JumpKind {
@@ -886,6 +885,17 @@ static int cfg_set_node_depth(struct cfg_node *s)
     return s->depth;
 }
 
+static __attribute__((unused)) void cfg_log_candidate_nodes()
+{
+    struct cfg_node *cur = candidate_nodes;
+    int i = 0;
+    while (cur != NULL) {
+        printf("id %2d: 0x%8x %6.2f  %3d %2d %8d\n", i, cur->addr, cur->score, cur->covered_blocks, cur->depth, cur->fuzz_cnt);
+        cur = cur->next;
+        i++;
+    }
+}
+
 static void cfg_nodes_init()
 {
     int i = 0;
@@ -907,21 +917,110 @@ static void cfg_nodes_init()
     }
 }
 
-/* append the node to candidate_nodes list tail */
-static void cfg_append_candidate_node(struct cfg_node *node)
+/* calculate the candidate_node's score */
+static void cfg_set_node_score(struct cfg_node *node)
 {
-    if (candidate_nodes_tail == NULL) {
-        candidate_nodes_tail = node;
-        candidate_nodes = node;
-        node->is_candidate = true;
-        return;
+    if (node->visited == false) {
+        node->score = 0;
     }
 
-    candidate_nodes_tail->next = node;
-    node->prev = candidate_nodes_tail;
-    candidate_nodes_tail = node;
+    node->score = node->covered_blocks * node->covered_blocks * 100000.0
+        / ((node->fuzz_cnt + 1) * (node->depth + 1));
 
+    return;
+}
+
+/* insert a new node to candidate_nodes list in descending order of score */
+static void cfg_insert_candidate_node(struct cfg_node *node)
+{
+    struct cfg_node *cur, *prev;
+
+    cfg_set_node_score(node);
+
+    cur = candidate_nodes;
+    prev = NULL;
+
+    DEBUG1("CFG: insert node 0x%x\n", node->addr);
+
+    while(cur != NULL) {
+        if (cur->score <= node->score) {
+            break;
+        }
+        prev = cur;
+        cur = cur->next;
+    }
+
+    if (prev == NULL) {
+        /* head of candidate_nodes */
+        candidate_nodes = node;
+        node->next = cur;
+        if (cur != NULL) {
+            cur->prev = node;
+        }
+    } else if (cur == NULL) {
+        /* tail of candidate_nodes */
+        prev->next = node;
+        node->prev = prev;
+    } else {
+        prev->next = node;
+        node->prev = prev;
+        cur->prev = node;
+        node->next = cur;
+    }
     node->is_candidate = true;
+}
+
+/* adjust the node position in candidate_nodes list */
+static void cfg_adjust_candidate_node(struct cfg_node *node)
+{
+    struct cfg_node *cur = node, *prev;
+    double old_score = node->score;
+
+    DEBUG1("CFG: adjust node 0x%x\n", node->addr);
+
+    cfg_set_node_score(node);
+
+    if (old_score > node->score) {
+        cur = node->next;
+        prev = node->prev;
+
+        /* delete node from the list */
+        if (prev != NULL)
+            prev->next = cur;
+        else
+            candidate_nodes = cur;
+        if (cur != NULL)
+            cur->prev = prev;
+
+        /* find new position */
+        while(cur != NULL) {
+            if (node->score > cur->score) {
+                break;
+            }
+            prev = cur;
+            cur = cur->next;
+        }
+        if (prev == NULL) {
+            /* head of candidate_nodes */
+            candidate_nodes = node;
+            node->next = cur;
+            node->prev = NULL;
+        } else if (cur == NULL) {
+            /* tail of candidate_nodes */
+            prev->next = node;
+            node->prev = prev;
+            node->next = NULL;
+        } else {
+            prev->next = node;
+            node->prev = prev;
+            cur->prev = node;
+            node->next = cur;
+        }
+    } else if (old_score == node->score) {
+        /* do nothing */
+    } else {
+        FATAL("adjust candidate node fail, score only can be smaller than old one.\n");
+    }
 }
 
 /* remove the node from candidate_nodes list */
@@ -931,11 +1030,10 @@ static void cfg_remove_candidate_node(struct cfg_node *node)
         return;
     }
 
+    DEBUG1("CFG: remove node 0x%x\n", node->addr);
+
     if (candidate_nodes == node) {
         candidate_nodes = node->next;
-    }
-    if (candidate_nodes_tail == node) {
-        candidate_nodes_tail = node->prev;
     }
 
     if (node->next)
@@ -992,7 +1090,7 @@ static void cfg_update_candidate_nodes(struct cfg_node *node)
     }
 
     if (cfg_check_candidate(node)) {
-        cfg_append_candidate_node(node);
+        cfg_insert_candidate_node(node);
     }
 }
 
@@ -1005,6 +1103,10 @@ static void cfg_update_predecessors_nodes(struct cfg_node *s, int l)
             continue;
         }
         p->covered_blocks--;
+        if (p->is_candidate) {
+            /* covered blocks has change */
+            cfg_adjust_candidate_node(p);
+        }
         p->covered = true;
         if (l > 0) {
             cfg_update_predecessors_nodes(p, l - 1);
@@ -1584,7 +1686,6 @@ static u32 * is_rb_hit_mini(u8* trace_bits_mini){
   int min_hit_index = 0;
 
   for (int i = 0; i < MAP_SIZE ; i ++){
-;
       if (unlikely (trace_bits_mini[i >> 3]  & (1 <<(i & 7)) )){
         int cur_index = i;
         int is_rare = contains_id(cur_index, rarest_branches);
