@@ -242,7 +242,8 @@ static inline void afl_maybe_log(abi_ulong cur_loc) {
   /* Looks like QEMU always maps to fixed locations, so ASAN is not a
      concern. Phew. But instruction addresses may be aligned. Let's mangle
      the value to get something quasi-uniform. */
-
+    if (cur_loc == ((u32 *)afl_area_ptr)[(MAP_SIZE >> 2) + 1])
+        ((u32 *)afl_area_ptr)[MAP_SIZE >> 2]++;
 #if 0
   trace_log = fopen("qemu_trace.log", "a+");
   fprintf(trace_log, "addr: %8x prev_loc %4x ", cur_loc, prev_loc);

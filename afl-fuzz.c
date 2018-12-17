@@ -290,10 +290,6 @@ static u8* (*post_handler)(u8* buf, u32* len);
 
 /* @RB@ Things about branches */
 
-static int * blacklist; 
-static int blacklist_size = 1024;
-static int blacklist_pos;
-
 static u32 rb_fuzzing = 0;           /* @RB@ non-zero branch index + 1 if fuzzing is being done with that branch constant*/
 static u32 total_branch_tries = 0;
 static u32 successful_branch_tries = 0;
@@ -1661,6 +1657,12 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
 /* return 0 if current trace bits hits branch with id branch_id,
   0 otherwise */
+static int hits_candidate_node(){
+  return (((u32 *)trace_bits)[MAP_SIZE >> 2] != 0);
+}
+
+/* return 0 if current trace bits hits branch with id branch_id,
+  0 otherwise */
 static int hits_branch(int branch_id){
   return (trace_bits[branch_id] != 0);
 }
@@ -2368,7 +2370,8 @@ EXP_ST void setup_shm(void) {
   memset(virgin_tmout, 255, MAP_SIZE);
   memset(virgin_crash, 255, MAP_SIZE);
 
-  shm_id = shmget(IPC_PRIVATE, MAP_SIZE, IPC_CREAT | IPC_EXCL | 0600);
+  /* last 2 word is hit flag and hit_node's addr */
+  shm_id = shmget(IPC_PRIVATE, MAP_SIZE + 8, IPC_CREAT | IPC_EXCL | 0600);
 
   if (shm_id < 0) PFATAL("shmget() failed");
 
@@ -3292,7 +3295,7 @@ static u8 run_target(char** argv, u32 timeout) {
      must prevent any earlier operations from venturing into that
      territory. */
 
-  memset(trace_bits, 0, MAP_SIZE);
+  memset(trace_bits, 0, MAP_SIZE + 4);
   MEM_BARRIER();
 
   /* If we're running in "dumb" mode, we can't rely on the fork server
@@ -6129,7 +6132,6 @@ static u8 fuzz_one(char** argv) {
 
   /* @afl-cfg Var */
   struct cfg_node *hit_node = NULL;
-  int hit_node_idx = -1;
  plain_afl = false;
 
  if (skip_deterministic){
@@ -6146,7 +6148,7 @@ static u8 fuzz_one(char** argv) {
 
 #else
 
-  if (1){
+  if (0){
 
     if (pending_favored) {
 
@@ -6198,21 +6200,25 @@ static u8 fuzz_one(char** argv) {
               /* this input has reacher this node, but has not fuzzed this node */
               hit_node = cur;
               queue_cur->node_bits[idx] = 2;
-              hit_node_idx = idx;
               break;
           } else {
               /* this node has fuzzed, only need to havoc */
               skip_simple_bitflip = 1;
               rb_skip_deterministic = 1;
               hit_node = cur;
-              hit_node_idx = idx;
               break;
           }
       }
 
       if (hit_node == NULL) {
-          plain_afl = true;
+          /* if this input not hit top 10% candidate nodes, 95% passby */
+          if (UR(100) > 95) {
+              plain_afl = true;
+          } else {
+            return 1;
+          }
       } else {
+        ((u32 *)trace_bits)[(MAP_SIZE >> 2) + 1] = hit_node->addr;
         hit_node->fuzz_cnt++;
         cfg_adjust_candidate_node(hit_node);
       }
@@ -6378,14 +6384,14 @@ re_run: // re-run when running in shadow mode
      this entry ourselves (was_fuzzed), or if it has gone through deterministic
      testing in earlier, resumed runs (passed_det). */
 
-  if ((!rb_fuzzing && skip_deterministic) || (plain_afl && queue_cur->was_fuzzed ) || (plain_afl && queue_cur->passed_det))
+  if (skip_deterministic || (plain_afl && queue_cur->was_fuzzed) || (plain_afl && queue_cur->passed_det))
     goto havoc_stage;
 
   /* Skip deterministic fuzzing if exec path checksum puts this out of scope
      for this master instance. */
 
   if (master_max && (queue_cur->exec_cksum % master_max) != master_id - 1) {
-    if (!rb_fuzzing || shadow_mode) goto havoc_stage;
+    if (plain_afl || shadow_mode) goto havoc_stage;
     // skip all but branch mask creation if we're RB fuzzing
     else {
       rb_skip_deterministic=1; 
@@ -6509,7 +6515,7 @@ re_run: // re-run when running in shadow mode
   stage_cycles[STAGE_FLIP1] += stage_max;
 
   /* @RB@ */
-  //DEBUG1("%swhile bitflipping, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
+  DEBUG1("%swhile bitflipping, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
 
 
 skip_simple_bitflip:
@@ -6558,8 +6564,8 @@ skip_simple_bitflip:
 
     if (common_fuzz_stuff(argv, out_buf, len)) goto abandon_entry;
 
-    if (rb_fuzzing && !shadow_mode && use_branch_mask > 0)
-      if (hits_branch(rb_fuzzing - 1)){
+    if (!plain_afl && !shadow_mode && use_branch_mask > 0)
+      if (hits_candidate_node()){
         branch_mask[stage_cur] = 1;
      }
 
@@ -6616,7 +6622,7 @@ skip_simple_bitflip:
   stage_cycles[STAGE_FLIP8] += stage_max;
 
   /* @RB@ also figure out add/delete map in this stage */
-  if (rb_fuzzing && !shadow_mode && use_branch_mask > 0){
+  if (!plain_afl && !shadow_mode && use_branch_mask > 0){
     
     // buffer to clobber with new things
     u8* tmp_buf = ck_alloc(len+1);
@@ -6635,7 +6641,7 @@ skip_simple_bitflip:
       if (common_fuzz_stuff(argv, tmp_buf, len - 1)) goto abandon_entry;
 
       /* if even with this byte deleted we hit the branch, can delete here */
-      if (hits_branch(rb_fuzzing - 1)){
+      if (hits_candidate_node()){
         branch_mask[stage_cur] += 2;
       }
     }
@@ -6654,7 +6660,7 @@ skip_simple_bitflip:
       if (common_fuzz_stuff(argv, tmp_buf, len + 1)) goto abandon_entry;
 
       /* if adding before still hit branch, can add */
-      if (hits_branch(rb_fuzzing - 1)){
+      if (hits_candidate_node()){
         branch_mask[stage_cur] += 4;
       }
 
@@ -6665,19 +6671,6 @@ skip_simple_bitflip:
     memcpy (orig_branch_mask, branch_mask, len + 1);
   }
 
-  if (rb_fuzzing && (successful_branch_tries == 0)){
-    if (blacklist_pos >= blacklist_size -1){
-      //DEBUG1("Increasing size of blacklist from %d to %d\n", blacklist_size, blacklist_size*2);
-      blacklist_size = 2 * blacklist_size; 
-      blacklist = ck_realloc(blacklist, sizeof(int) * blacklist_size);
-      if (!blacklist){
-        PFATAL("Failed to realloc blacklist");
-      }
-    }
-    blacklist[blacklist_pos++] = rb_fuzzing -1;
-    blacklist[blacklist_pos] = -1;
-    DEBUG1("adding branch %i to blacklist\n", rb_fuzzing-1);
-  }
   /* @RB@ reset stats for debugging*/
   //DEBUG1("%swhile calibrating, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
   //DEBUG1("%scalib stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
@@ -9350,9 +9343,6 @@ int main(int argc, char** argv) {
   u8  exit_1 = !!getenv("AFL_BENCH_JUST_ONE");
   char** use_argv;
 
-  blacklist = ck_alloc(sizeof(int) * blacklist_size);
-  blacklist[0] = -1;
-
   struct timeval tv;
   struct timezone tz;
 
@@ -9754,7 +9744,6 @@ stop_fuzzing:
 
   dump_to_logs();
   fclose(plot_file);
-  ck_free(blacklist);
   destroy_queue();
   destroy_extras();
   ck_free(target_path);
