@@ -290,11 +290,6 @@ static u8* (*post_handler)(u8* buf, u32* len);
 
 /* @RB@ Things about branches */
 
-static u32 vanilla_afl = 1000;      /* @RB@ How many executions to conduct 
-                                         in vanilla AFL mode               */
-static u32 MAX_RARE_BRANCHES = 256;
-static int rare_branch_exp = 4;        /* @RB@ less than 2^rare_branch_exp is rare*/
-
 static int * blacklist; 
 static int blacklist_size = 1024;
 static int blacklist_pos;
@@ -309,15 +304,10 @@ static u8 run_with_shadow = 0;
 
 static u8 use_branch_mask = 1;
 
-static int prev_cycle_wo_new = 0;
-static int cycle_wo_new = 0;
-
-static int bootstrap = 0; /* @RB@ */
-static u8 skip_deterministic_bootstrap = 0;
-
 static int trim_for_branch = 0;
 
 /* @afl-cfg: control flow graph node information */
+static bool plain_afl = false;
 #define CFG_BLOCK_LEVEL     5
 struct cfg_node {
     u32 addr;
@@ -817,53 +807,57 @@ static u32 cfg_cal_covered_block(struct cfg_node *p, int l)
 {
     u32 i;
     int ret = 0;
-    for (i = 0; i < p->s_size; i++) {
-        struct cfg_node *s = p->successors[i];
-        if (s->covered == true) {
-            continue;
+    struct bfs_node_list {
+        int level;
+        struct cfg_node *node;
+        struct bfs_node_list *next;
+    };
+
+    struct bfs_node_list *bfs_head, *bfs_cur, *bfs_tail;
+
+    p->covered = true;
+    bfs_head = malloc(sizeof(struct bfs_node_list));
+    bfs_head->node = p;
+    bfs_head->next = NULL;
+    bfs_head->level = l;
+
+    bfs_cur = bfs_head;
+    bfs_tail = bfs_head;
+
+    while(bfs_cur != NULL) {
+        if (bfs_cur->level == 0) {
+            /* rest of the list's node's level will all be 0 */
+            break;
+        } else {
+            for (i = 0; i < bfs_cur->node->s_size; i++) {
+                struct cfg_node *s = bfs_cur->node->successors[i];
+                struct bfs_node_list *bfs_new;
+                if (s->covered == true) {
+                    continue;
+                }
+                ret++;
+                s->covered = true;
+
+                bfs_new = malloc(sizeof(struct bfs_node_list));
+                bfs_new->level = bfs_cur->level - 1;
+                bfs_new->node = s;
+                bfs_new->next = NULL;
+                bfs_tail->next = bfs_new;
+                bfs_tail = bfs_new;
+            }
+            bfs_cur = bfs_cur->next;
         }
-        ret++;
-        s->covered = true;
-        if (l > 0) {
-            ret += cfg_cal_covered_block(s, l - 1);
-        }
+
+    }
+
+    bfs_cur = bfs_head;
+    while(bfs_cur != NULL) {
+        struct bfs_node_list *temp = bfs_cur;
+        bfs_cur->node->covered = false;
+        bfs_cur = bfs_cur->next;
+        free(temp);
     }
     return ret;
-}
-
-/* @afl-cfg: pair function of cfg_cal_covered_block */
-static void cfg_clear_covered_flag_down(struct cfg_node *p, int l)
-{
-    u32 i;
-
-    for (i = 0; i < p->s_size; i++) {
-        struct cfg_node *s = p->successors[i];
-        if (s->covered == false) {
-            continue;
-        }
-
-        s->covered = false;
-        if (l > 0) {
-            cfg_clear_covered_flag_down(s, l - 1);
-        }
-    }
-}
-
-static void cfg_clear_covered_flag_up(struct cfg_node *s, int l)
-{
-    u32 i;
-
-    for (i = 0; i < s->p_size; i++) {
-        struct cfg_node *p = s->predecessors[i];
-        if (p->covered == false) {
-            continue;
-        }
-
-        p->covered = false;
-        if (l > 0) {
-            cfg_clear_covered_flag_up(p, l - 1);
-        }
-    }
 }
 
 static int cfg_set_node_depth(struct cfg_node *s)
@@ -890,8 +884,9 @@ static __attribute__((unused)) void cfg_log_candidate_nodes()
 {
     struct cfg_node *cur = candidate_nodes;
     int i = 0;
+    DEBUG1("\n#### log candidate nodes ####\n");
     while (cur != NULL) {
-        printf("id %2d: 0x%8x %6.2f  %3d %2d %8d\n", i, cur->addr, cur->score, cur->covered_blocks, cur->depth, cur->fuzz_cnt);
+        DEBUG1("id %2d: 0x%8x %6.2f  %3d %2d %8d\n", i, cur->addr, cur->score, cur->covered_blocks, cur->depth, cur->fuzz_cnt);
         cur = cur->next;
         i++;
     }
@@ -903,12 +898,8 @@ static void cfg_nodes_init()
 
     for(i = 0; i < cfg_hash_size; i++) {
         if (cfg_nodes[i].mapped == true) {
-            cfg_nodes[i].covered = true;
             cfg_nodes[i].covered_blocks =
-                cfg_cal_covered_block(&cfg_nodes[i], CFG_BLOCK_LEVEL - 1);
-
-            cfg_nodes[i].covered = false;
-            cfg_clear_covered_flag_down(&cfg_nodes[i], CFG_BLOCK_LEVEL - 1);
+                cfg_cal_covered_block(&cfg_nodes[i], CFG_BLOCK_LEVEL);
         }
     }
 
@@ -1007,6 +998,7 @@ static void cfg_adjust_candidate_node(struct cfg_node *node)
             candidate_nodes = node;
             node->next = cur;
             node->prev = NULL;
+            cur->prev = node;
         } else if (cur == NULL) {
             /* tail of candidate_nodes */
             prev->next = node;
@@ -1023,6 +1015,7 @@ static void cfg_adjust_candidate_node(struct cfg_node *node)
     } else {
         FATAL("adjust candidate node fail, score only can be smaller than old one.\n");
     }
+
 }
 
 /* remove the node from candidate_nodes list */
@@ -1050,15 +1043,18 @@ static void cfg_remove_candidate_node(struct cfg_node *node)
     node->is_candidate = false;
 }
 
-/* check the node whether it can be candidate */
-static bool cfg_check_candidate(struct cfg_node *node)
+/* check the node whether it can be candidate,
+ * 0 for should not add to list or should remove from the list
+ * 1 for should add to list
+ * 2 keep in list */
+static u8 cfg_check_candidate(struct cfg_node *node)
 {
     u32 i;
     bool has_unvisited = false;
 
     /* 1st: it should have been visited */
     if (node->visited == false) {
-        return false;
+        return 0;
     }
 
     /* 2nd: it has at least one node hasn't been visited */
@@ -1070,21 +1066,91 @@ static bool cfg_check_candidate(struct cfg_node *node)
         }
     }
 
-    return has_unvisited;
+    if (has_unvisited == true && node->is_candidate == true) {
+        /* keep in list */
+        return 2;
+    } else if (has_unvisited == true) {
+        /* add to list */
+        return 1;
+    } else {
+        /* remove from list or not to add to list*/
+        return 0;
+    }
+}
+
+static void cfg_update_predecessors_nodes(struct cfg_node *s, int l)
+{
+    u32 i;
+    struct bfs_node_list {
+        int level;
+        struct cfg_node *node;
+        struct bfs_node_list *next;
+    };
+
+    struct bfs_node_list *bfs_head, *bfs_cur, *bfs_tail;
+
+    s->covered = true;
+    bfs_head = malloc(sizeof(struct bfs_node_list));
+    bfs_head->node = s;
+    bfs_head->next = NULL;
+    bfs_head->level = l;
+
+    bfs_cur = bfs_head;
+    bfs_tail = bfs_head;
+
+    while(bfs_cur != NULL) {
+        if (bfs_cur->level == 0) {
+            /* rest of the list's node's level will all be 0 */
+            break;
+        } else {
+            for (i = 0; i < bfs_cur->node->p_size; i++) {
+                struct cfg_node *p = bfs_cur->node->predecessors[i];
+                struct bfs_node_list *bfs_new;
+                if (p->covered == true) {
+                    continue;
+                }
+                p->covered_blocks--;
+                if (p->is_candidate) {
+                    cfg_adjust_candidate_node(p);
+                }
+                p->covered = true;
+
+                bfs_new = malloc(sizeof(struct bfs_node_list));
+                bfs_new->level = bfs_cur->level - 1;
+                bfs_new->node = p;
+                bfs_new->next = NULL;
+                bfs_tail->next = bfs_new;
+                bfs_tail = bfs_new;
+            }
+            bfs_cur = bfs_cur->next;
+        }
+
+    }
+
+    bfs_cur = bfs_head;
+    while(bfs_cur != NULL) {
+        struct bfs_node_list *temp = bfs_cur;
+        bfs_cur->node->covered = false;
+        bfs_cur = bfs_cur->next;
+        free(temp);
+    }
 }
 
 /* if is a new visited node, update the candidate_nodes list */
-static void cfg_update_candidate_nodes(struct cfg_node *node)
+static void cfg_visit_new_node(struct cfg_node *node)
 {
     u32 i;
+    u8 op;
 
-    /* check each predecessors */
+    DEBUG1("****** visit new node 0x%x\n", node->addr);
+    node->visited = true;
+    /* check each predecessors if is candidated */
     for (i = 0; i < node->p_size; i++) {
         struct cfg_node *p = node->predecessors[i];
-        if (p->is_candidate == true && p->visited == true) {
+        if (p->is_candidate == true) {
             /* if predecessor is candidated,
              * remove when no unvisited successors */
-            if (!cfg_check_candidate(p)) {
+            if (cfg_check_candidate(p) == 0) {
                 /* no unvisited successors for this node,
                  * remove from candidate_nodes*/
                 cfg_remove_candidate_node(p);
@@ -1092,52 +1158,27 @@ static void cfg_update_candidate_nodes(struct cfg_node *node)
         }
     }
 
-    if (cfg_check_candidate(node)) {
+    /* update the covered_blocks for predecessors */
+    cfg_update_predecessors_nodes(node, CFG_BLOCK_LEVEL);
+
+
+    op = cfg_check_candidate(node);
+    if (op == 1) {
         cfg_insert_candidate_node(node);
+    } else if (op != 0) {
+        PFATAL("new visited can not in candidate before\n");
     }
+    cfg_log_candidate_nodes();
 }
 
-static void cfg_update_predecessors_nodes(struct cfg_node *s, int l)
-{
-    u32 i;
-    for (i = 0; i < s->p_size; i++) {
-        struct cfg_node *p = s->predecessors[i];
-        if (p->covered == true) {
-            continue;
-        }
-        p->covered_blocks--;
-        if (p->is_candidate) {
-            /* covered blocks has change */
-            cfg_adjust_candidate_node(p);
-        }
-        p->covered = true;
-        if (l > 0) {
-            cfg_update_predecessors_nodes(p, l - 1);
-        }
-    }
-}
-
-static void cfg_update_nodes(u32 idx) {
+static void cfg_update_edge(u32 idx) {
     if (cfg_edges[idx].marked) {
         if (cfg_edges[idx].cur_node->visited == false) {
-            cfg_edges[idx].cur_node->visited = true;
-
-            cfg_update_candidate_nodes(cfg_edges[idx].cur_node);
-
-            cfg_edges[idx].cur_node->covered = true;
-            cfg_update_predecessors_nodes(cfg_edges[idx].cur_node, CFG_BLOCK_LEVEL - 1);
-            cfg_edges[idx].cur_node->covered = false;
-            cfg_clear_covered_flag_up(cfg_edges[idx].cur_node, CFG_BLOCK_LEVEL - 1);
+            cfg_visit_new_node(cfg_edges[idx].cur_node);
         }
+
         if (cfg_edges[idx].next_node->visited == false) {
-            cfg_edges[idx].next_node->visited = true;
-
-            cfg_update_candidate_nodes(cfg_edges[idx].next_node);
-
-            cfg_edges[idx].next_node->covered = true;
-            cfg_update_predecessors_nodes(cfg_edges[idx].next_node, CFG_BLOCK_LEVEL - 1);
-            cfg_edges[idx].next_node->covered = false;
-            cfg_clear_covered_flag_up(cfg_edges[idx].next_node, CFG_BLOCK_LEVEL - 1);
+            cfg_visit_new_node(cfg_edges[idx].next_node);
         }
     }
 }
@@ -1618,124 +1659,10 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 
 }
 
-/* True if branch_ids contains branch_id*/
-static int contains_id(int branch_id, int* branch_ids){
-  for (int i = 0; branch_ids[i] != -1; i++){
-    if (branch_ids[i] == branch_id) return 1;
-	}
-  return 0; 
-}
-
-/* you'll have to free the return pointer. */
-static int* get_lowest_hit_branch_ids(){
-  int * rare_branch_ids = ck_alloc(sizeof(int) * MAX_RARE_BRANCHES);
-  int lowest_hob = INT_MAX;
-  int ret_list_size = 0;
-
-  for (int i = 0; (i < MAP_SIZE) && (ret_list_size < MAX_RARE_BRANCHES - 1); i++){
-    // ignore unseen branches. sparse array -> unlikely 
-    if (unlikely(hit_bits[i] > 0)){
-      if (contains_id(i, blacklist)) continue;
-      unsigned int long cur_hits = hit_bits[i];
-      int highest_order_bit = 0;
-      while(cur_hits >>=1)
-          highest_order_bit++;
-      lowest_hob = highest_order_bit < lowest_hob ? highest_order_bit : lowest_hob;
-      if (highest_order_bit < rare_branch_exp){
-        // if we are an order of magnitude smaller, prioritize the
-        // rarer branches
-        if (highest_order_bit < rare_branch_exp - 1){
-          rare_branch_exp = highest_order_bit + 1;
-          // everything else that came before had way more hits
-          // than this one, so remove from list
-          ret_list_size = 0;
-        }
-        rare_branch_ids[ret_list_size] = i;
-        ret_list_size++;
-      }
-
-    }
-  }
-
-  if (ret_list_size == 0){
-    DEBUG1("Was returning list of size 0\n");
-    if (lowest_hob != INT_MAX) {
-      rare_branch_exp = lowest_hob + 1;
-      DEBUG1("Upped max exp to %i\n", rare_branch_exp);
-      ck_free(rare_branch_ids);
-      return get_lowest_hit_branch_ids();
-    }
-  }
-
-  rare_branch_ids[ret_list_size] = -1;
-  return rare_branch_ids;
-
-}
-
 /* return 0 if current trace bits hits branch with id branch_id,
   0 otherwise */
 static int hits_branch(int branch_id){
   return (trace_bits[branch_id] != 0);
-}
-
-// checks if hits a rare branch with mini trace bits
-// returns NULL if the trace bits does not hit a rare branch
-// else returns a list of all the rare branches hit
-// by the mini trace bits, in decreasing order of rarity
-static u32 * is_rb_hit_mini(u8* trace_bits_mini){
-  int * rarest_branches = get_lowest_hit_branch_ids();
-  u32 * branch_ids = ck_alloc(sizeof(u32) * MAX_RARE_BRANCHES);
-  u32 * branch_cts = ck_alloc(sizeof(u32) * MAX_RARE_BRANCHES);
-  int min_hit_index = 0;
-
-  for (int i = 0; i < MAP_SIZE ; i ++){
-      if (unlikely (trace_bits_mini[i >> 3]  & (1 <<(i & 7)) )){
-        int cur_index = i;
-        int is_rare = contains_id(cur_index, rarest_branches);
-        if (is_rare) {
-          // at loop initialization, set min_branch_hit properly
-          if (!min_hit_index) {
-            branch_cts[min_hit_index] = hit_bits[cur_index];
-            branch_ids[min_hit_index] = cur_index + 1;
-          }
-          // in general just check if we're a smaller branch 
-          // than the previously found min
-          int j;
-          for (j = 0 ; j < min_hit_index; j++){
-            if (hit_bits[cur_index] <= branch_cts[j]){
-              memmove(branch_cts + j + 1, branch_cts + j, min_hit_index -j);
-              memmove(branch_ids + j + 1, branch_ids + j, min_hit_index -j);
-              branch_cts[j] = hit_bits[cur_index];
-              branch_ids[j] = cur_index + 1;
-            }
-          }
-          // append at end
-          if (j == min_hit_index){
-            branch_cts[j] = hit_bits[cur_index];
-            // + 1 so we can distinguish 0 from other cases
-            branch_ids[j] = cur_index + 1;
-
-          }
-          // this is only incremented when is_rare holds, which should
-          // only happen a max of MAX_RARE_BRANCHES -1 times -- the last
-          // time we will never reenter so this is always < MAX_RARE_BRANCHES
-          // at the top of the if statement
-          min_hit_index++;
-        }
-      }
-
-  }
-  ck_free(branch_cts);
-  ck_free(rarest_branches);
-  if (min_hit_index == 0){
-      ck_free(branch_ids);
-      branch_ids = NULL;
-  } else {
-    // 0 terminate the array
-    branch_ids[min_hit_index] = 0;
-  }
-  return branch_ids;
-
 }
 
 /* get a random modifiable position (i.e. where branch_mask & mod_type) 
@@ -2008,7 +1935,7 @@ static inline u8 has_new_bits(u8* virgin_map, bool need_update_candidate) {
                 int j;
                 for (j = 0; j < 8; j++) {
                     if (cur[j] && vir[j] == 0xff) {
-                        cfg_update_nodes(((MAP_SIZE >> 3) - i - 1) * 8 + j);
+                        cfg_update_edge(((MAP_SIZE >> 3) - i - 1) * 8 + j);
                     }
                 }
             }
@@ -2023,7 +1950,7 @@ static inline u8 has_new_bits(u8* virgin_map, bool need_update_candidate) {
                 int j;
                 for (j = 0; j < 4; j++) {
                     if (cur[j] && vir[j] == 0xff) {
-                        cfg_update_nodes(((MAP_SIZE >> 2) - i - 1) * 4 + j);
+                        cfg_update_edge(((MAP_SIZE >> 2) - i - 1) * 4 + j);
                     }
                 }
             }
@@ -5729,8 +5656,6 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   fault = run_target(argv, exec_tmout);
 
-  if (vanilla_afl) --vanilla_afl;
-
   if (stop_soon) return 1;
 
   if (fault == FAULT_TMOUT) {
@@ -6201,19 +6126,11 @@ static u8 fuzz_one(char** argv) {
   u32 orig_queued_with_cov = queued_with_cov;
   u32 orig_queued_discovered = queued_discovered;
   u32 orig_total_execs = total_execs;
-  
 
-  if (!vanilla_afl){
-    if (prev_cycle_wo_new && bootstrap){
-      vanilla_afl = 1;
-      rb_fuzzing = 0;
-      if (bootstrap == 2){
-        skip_deterministic_bootstrap = 1;
-
-      }
-    }
-
-  }
+  /* @afl-cfg Var */
+  struct cfg_node *hit_node = NULL;
+  int hit_node_idx = -1;
+ plain_afl = false;
 
  if (skip_deterministic){
   rb_skip_deterministic = 1;
@@ -6229,7 +6146,7 @@ static u8 fuzz_one(char** argv) {
 
 #else
 
-  if (vanilla_afl){
+  if (1){
 
     if (pending_favored) {
 
@@ -6262,75 +6179,43 @@ static u8 fuzz_one(char** argv) {
 
 #endif /* ^IGNORE_FINDS */
 
-  /* select inputs which hit rare branches */
-  if (!vanilla_afl) {
-    skip_deterministic_bootstrap = 0;
-    u32 * min_branch_hits = is_rb_hit_mini(queue_cur->trace_mini);
+  /* select inputs which hit candidate nodes */
 
-    if (min_branch_hits == NULL){
-      // not a rare hit. don't fuzz.
-      return 1;
-    } else { 
-      int ii;
-      for (ii = 0; min_branch_hits[ii] != 0; ii++){
-        rb_fuzzing = min_branch_hits[ii];
-        if (rb_fuzzing){
-          int byte_offset = (rb_fuzzing - 1) >> 3;
-          int bit_offset = (rb_fuzzing - 1) & 7;
-
-          // skip deterministic if we have fuzzed this min branch
-          if (queue_cur->fuzzed_branches[byte_offset] & (1 << (bit_offset))){
-            // let's try the next one
-            continue;
+  if (candidate_nodes_cnt == 0) {
+      /* regular afl */
+      plain_afl = true;
+  } else {
+      u32 idx;
+      struct cfg_node *cur = candidate_nodes;
+      for (i = 0; i < candidate_nodes_cnt / 10 + 1; i++) {
+          idx = cfg_find_node_idx(cur->addr);
+          u8 fuzz_status = queue_cur->node_bits[idx];
+          if (fuzz_status == 0) {
+              /* this input has not reached this node */
+              cur = cur->next;
+              continue;
+          } else if (fuzz_status == 1) {
+              /* this input has reacher this node, but has not fuzzed this node */
+              hit_node = cur;
+              queue_cur->node_bits[idx] = 2;
+              hit_node_idx = idx;
+              break;
           } else {
-            for (int k = 0; k < MAP_SIZE >> 3; k ++){
-              if (queue_cur->fuzzed_branches[k] != 0){
-                DEBUG1("We fuzzed this guy already\n");
-                skip_simple_bitflip = 1;
-                break;
-              }
-            }
-            // indicate we have fuzzed this branch id
-            queue_cur->fuzzed_branches[byte_offset] |= (1 << (bit_offset)); 
-            // chose minimum
-            break;
+              /* this node has fuzzed, only need to havoc */
+              skip_simple_bitflip = 1;
+              rb_skip_deterministic = 1;
+              hit_node = cur;
+              hit_node_idx = idx;
+              break;
           }
-        } else break; 
       }
-      // if we got to the end of min_branch_hits...
-      // it's either because we fuzzed all the things in min_branch_hits
-      // or because there was nothing. If there was nothing, 
-      // min_branch_hits[0] should be 0 
-      if (!rb_fuzzing || (min_branch_hits[ii] == 0)){
-        rb_fuzzing = min_branch_hits[0];
-        if (!rb_fuzzing) {
-          return 1;
-        }
-        DEBUG1("We fuzzed this guy already for real\n");
-        skip_simple_bitflip = 1;
-        rb_skip_deterministic = 1;
+
+      if (hit_node == NULL) {
+          plain_afl = true;
+      } else {
+        hit_node->fuzz_cnt++;
+        cfg_adjust_candidate_node(hit_node);
       }
-      ck_free(min_branch_hits);
-
-    if (!skip_simple_bitflip){
-      cycle_wo_new = 0; 
-    }
-    //rarest_branches = get_lowest_hit_branch_ids();
-    //DEBUG1("---\ncurrent rarest branches: ");
-    //for (int k = 0; rarest_branches[k] != -1 ; k++){
-    //  DEBUG1("%i (%u) ", rarest_branches[k], hit_bits[rarest_branches[k]]);
-    //}
-    //DEBUG1("\n");
-
-    DEBUG1("Trying to fuzz input %s: \n", queue_cur->fname);
-    //for (int k = 0; k < len; k++) DEBUG1("%c", out_buf[k]);
-    //DEBUG1("\n");
-
-
-    DEBUG1("which hit branch %i (hit by %u inputs) \n", rb_fuzzing -1, hit_bits[rb_fuzzing -1]);
-    //ck_free(rarest_branches);
-   
-    }
   }
 
   if (not_on_tty) {
@@ -6478,7 +6363,7 @@ re_run: // re-run when running in shadow mode
 
   // @RB@: allocate the branch mask
 
-  if (vanilla_afl || shadow_mode || (use_branch_mask == 0)){
+  if (plain_afl || shadow_mode || (use_branch_mask == 0)){
       branch_mask = alloc_branch_mask(len + 1);
       orig_branch_mask = alloc_branch_mask(len + 1);
   } else {
@@ -6493,7 +6378,7 @@ re_run: // re-run when running in shadow mode
      this entry ourselves (was_fuzzed), or if it has gone through deterministic
      testing in earlier, resumed runs (passed_det). */
 
-  if ((!rb_fuzzing && skip_deterministic) || skip_deterministic_bootstrap || (vanilla_afl && queue_cur->was_fuzzed ) || (vanilla_afl && queue_cur->passed_det))
+  if ((!rb_fuzzing && skip_deterministic) || (plain_afl && queue_cur->was_fuzzed ) || (plain_afl && queue_cur->passed_det))
     goto havoc_stage;
 
   /* Skip deterministic fuzzing if exec path checksum puts this out of scope
@@ -6624,7 +6509,7 @@ re_run: // re-run when running in shadow mode
   stage_cycles[STAGE_FLIP1] += stage_max;
 
   /* @RB@ */
-  DEBUG1("%swhile bitflipping, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
+  //DEBUG1("%swhile bitflipping, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
 
 
 skip_simple_bitflip:
@@ -6782,7 +6667,7 @@ skip_simple_bitflip:
 
   if (rb_fuzzing && (successful_branch_tries == 0)){
     if (blacklist_pos >= blacklist_size -1){
-      DEBUG1("Increasing size of blacklist from %d to %d\n", blacklist_size, blacklist_size*2);
+      //DEBUG1("Increasing size of blacklist from %d to %d\n", blacklist_size, blacklist_size*2);
       blacklist_size = 2 * blacklist_size; 
       blacklist = ck_realloc(blacklist, sizeof(int) * blacklist_size);
       if (!blacklist){
@@ -6794,9 +6679,9 @@ skip_simple_bitflip:
     DEBUG1("adding branch %i to blacklist\n", rb_fuzzing-1);
   }
   /* @RB@ reset stats for debugging*/
-  DEBUG1("%swhile calibrating, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
-  DEBUG1("%scalib stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
-  DEBUG1("%scalib stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
+  //DEBUG1("%swhile calibrating, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
+  //DEBUG1("%scalib stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
+  //DEBUG1("%scalib stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
   successful_branch_tries = 0;
   total_branch_tries = 0;
 
@@ -7698,9 +7583,9 @@ skip_extras:
   if (!queue_cur->passed_det) mark_as_det_done(queue_cur);
 
   /* @RB@ reset stats for debugging*/
-  DEBUG1("%sIn deterministic stage, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
-  DEBUG1("%sdet stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
-  DEBUG1("%sdet stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
+  //DEBUG1("%sIn deterministic stage, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
+  //DEBUG1("%sdet stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
+  //DEBUG1("%sdet stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
 
   successful_branch_tries = 0;
   total_branch_tries = 0;
@@ -8342,17 +8227,15 @@ abandon_entry:
   }
 
   /* @RB@ reset stats for debugging*/
-  DEBUG1("%sIn havoc stage, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
+  //DEBUG1("%sIn havoc stage, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
   successful_branch_tries = 0;
   total_branch_tries = 0;
-  DEBUG1("%shavoc stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
-  DEBUG1("%shavoc stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
+  //DEBUG1("%shavoc stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
+  //DEBUG1("%shavoc stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
   if (shadow_mode) goto re_run;
 
   if (queued_with_cov-orig_queued_with_cov){
-    prev_cycle_wo_new = 0;
-    vanilla_afl = 0;
-    cycle_wo_new = 0;
+    plain_afl = false;
   }
 
   munmap(orig_in, queue_cur->len);
@@ -8813,11 +8696,6 @@ static void usage(u8* argv0) {
        "  -r            - (RB) add an additional trimming stage for rare branches\n"
        "  -b            - (RB) disable the use of branch mask to guide execution\n"
        "  -x dir        - optional fuzzer dictionary (see README)\n"
-       "  -q num        - (RB) bootstrap rare branches with:\n"
-       "                  num=1: regular AFL queueing until a new branch is discovered\n"
-       "                  num=2: regular AFL queueing, no determistic fuzzing,\n"
-       "                         until a new branch is discovered\n"
-       "                  num=3: regular AFL queueing for one cycle\n\n"
 
        "Other stuff:\n\n"
 
@@ -9493,10 +9371,6 @@ int main(int argc, char** argv) {
         use_branch_mask = 0;
         break;
 
-      case 'q': /* bootstrap queueing after being stuck */
-        bootstrap = strtol(optarg, 0, 10);
-        break;
-
       case 'r': /* trim for branch */
         trim_for_branch = 1;
         break;
@@ -9735,7 +9609,7 @@ int main(int argc, char** argv) {
 
   memset(hit_bits, 0, sizeof(hit_bits));
   if (in_place_resume) {
-    vanilla_afl = 0;
+    plain_afl = false;
     init_hit_bits();
   }
 
@@ -9793,6 +9667,8 @@ int main(int argc, char** argv) {
     if (stop_soon) goto stop_fuzzing;
   }
 
+  //cfg_log_candidate_nodes();
+
   while (1) {
 
     u8 skipped_fuzz;
@@ -9800,13 +9676,6 @@ int main(int argc, char** argv) {
 
     if (!queue_cur) {
       DEBUG1("Entering new queueing cycle\n");
-      if (prev_cycle_wo_new && (bootstrap == 3)){
-        // only bootstrap for 1 cycle
-        prev_cycle_wo_new = 0;
-      } else {
-        prev_cycle_wo_new = cycle_wo_new;
-      }
-      cycle_wo_new = 1;
 
       queue_cycle++;
       current_entry     = 0;
@@ -9839,6 +9708,8 @@ int main(int argc, char** argv) {
 
       if (sync_id && queue_cycle == 1 && getenv("AFL_IMPORT_FIRST"))
         sync_fuzzers(use_argv);
+
+      cfg_log_candidate_nodes();
 
     }
 
