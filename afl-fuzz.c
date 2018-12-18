@@ -6170,7 +6170,7 @@ static u8 fuzz_one(char** argv) {
 
 #else
 
-  if (0){
+  if (1){
 
     if (pending_favored) {
 
@@ -6211,24 +6211,44 @@ static u8 fuzz_one(char** argv) {
   } else {
       u32 idx;
       struct cfg_node *cur = candidate_nodes;
-      for (i = 0; i < candidate_nodes_cnt / 10 + 1; i++) {
+      for (i = 0; i < candidate_nodes_cnt; i++) {
+          if (cur->fuzz_cnt != 0) {
+              cur = cur->next;
+              continue;
+          }
           idx = cfg_find_node_idx(cur->addr);
           u8 fuzz_status = queue_cur->node_bits[idx];
           if (fuzz_status == 0) {
               /* this input has not reached this node */
               cur = cur->next;
               continue;
-          } else if (fuzz_status == 1) {
-              /* this input has reacher this node, but has not fuzzed this node */
+          } else {
               hit_node = cur;
               queue_cur->node_bits[idx] = 2;
               break;
-          } else {
-              /* this node has fuzzed, only need to havoc */
-              skip_simple_bitflip = 1;
-              rb_skip_deterministic = 1;
-              hit_node = cur;
-              break;
+          }
+      }
+      if (hit_node == NULL) {
+          cur = candidate_nodes;
+          for (i = 0; i < candidate_nodes_cnt / 10 + 1; i++) {
+              idx = cfg_find_node_idx(cur->addr);
+              u8 fuzz_status = queue_cur->node_bits[idx];
+              if (fuzz_status == 0) {
+                  /* this input has not reached this node */
+                  cur = cur->next;
+                  continue;
+              } else if (fuzz_status == 1) {
+                  /* this input has reacher this node, but has not fuzzed this node */
+                  hit_node = cur;
+                  queue_cur->node_bits[idx] = 2;
+                  break;
+              } else {
+                  /* this node has fuzzed, only need to havoc */
+                  skip_simple_bitflip = 1;
+                  rb_skip_deterministic = 1;
+                  hit_node = cur;
+                  break;
+              }
           }
       }
 
