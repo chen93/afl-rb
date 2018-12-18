@@ -350,6 +350,9 @@ struct cfg_edge {
     struct cfg_node *next_node;
 };
 static struct cfg_edge cfg_edges[MAP_SIZE];
+static u64 cfg_tot_fuzz_cnt = 0;
+static u64 cfg_rand_fuzz_cnt =0;
+static u64 cfg_candidate_fuzz_cnt = 0;
 
 /* Interesting values, as per config.h */
 
@@ -856,24 +859,43 @@ static u32 cfg_cal_covered_block(struct cfg_node *p, int l)
     return ret;
 }
 
-static int cfg_set_node_depth(struct cfg_node *s)
+/* set nodes depth from a root node which means this node has no predecessores */
+static void cfg_update_nodes_depth(struct cfg_node *root)
 {
-    int min_pred_depth = 0x7fffffff;
-    u32 i;
+    struct bfs_node_list {
+        struct cfg_node *node;
+        struct bfs_node_list *next;
+    };
 
-    if (s->depth != -1) {
-        return s->depth;
+    struct bfs_node_list *bfs_cur, *bfs_tail;
+
+    root->depth = 0;
+    bfs_cur = malloc(sizeof(struct bfs_node_list));
+    bfs_cur->node = root;
+    bfs_cur->next = NULL;
+
+    bfs_tail = bfs_cur;
+
+    while(bfs_cur != NULL) {
+        u32 i;
+        struct bfs_node_list *tmp = bfs_cur;
+        for (i = 0; i < bfs_cur->node->s_size; i++) {
+            struct cfg_node *s = bfs_cur->node->successors[i];
+            struct bfs_node_list *bfs_new;
+            if ((s->depth != -1) && (s->depth < (bfs_cur->node->depth + 1))) {
+                continue;
+            }
+            s->depth = bfs_cur->node->depth + 1;
+
+            bfs_new = malloc(sizeof(struct bfs_node_list));
+            bfs_new->node = s;
+            bfs_new->next = NULL;
+            bfs_tail->next = bfs_new;
+            bfs_tail = bfs_new;
+        }
+        bfs_cur = bfs_cur->next;
+        free(tmp);
     }
-
-    for (i = 0; i < s->p_size; i++) {
-        min_pred_depth = MIN(min_pred_depth, cfg_set_node_depth(s->predecessors[i]));
-    }
-    if (min_pred_depth != 0x7fffffff)
-        s->depth = min_pred_depth + 1;
-    else
-        s->depth = 0;
-
-    return s->depth;
 }
 
 static __attribute__((unused)) void cfg_log_candidate_nodes()
@@ -900,8 +922,8 @@ static void cfg_nodes_init()
     }
 
     for (i = 0; i < cfg_hash_size; i++) {
-        if (cfg_nodes[i].mapped == true)
-            cfg_set_node_depth(&cfg_nodes[i]);
+        if (cfg_nodes[i].mapped == true && cfg_nodes[i].p_size == 0)
+            cfg_update_nodes_depth(&cfg_nodes[i]);
     }
 }
 
@@ -965,7 +987,7 @@ static void cfg_adjust_candidate_node(struct cfg_node *node)
     struct cfg_node *cur = node, *prev;
     double old_score = node->score;
 
-    DEBUG1("CFG: adjust node 0x%x\n", node->addr);
+    //DEBUG1("CFG: adjust node 0x%x\n", node->addr);
 
     cfg_set_node_score(node);
 
@@ -1164,7 +1186,7 @@ static void cfg_visit_new_node(struct cfg_node *node)
     } else if (op != 0) {
         PFATAL("new visited can not in candidate before\n");
     }
-    cfg_log_candidate_nodes();
+    //cfg_log_candidate_nodes();
 }
 
 static void cfg_update_edge(u32 idx) {
@@ -6210,16 +6232,23 @@ static u8 fuzz_one(char** argv) {
           }
       }
 
+      cfg_tot_fuzz_cnt++;
       if (hit_node == NULL) {
           /* if this input not hit top 10% candidate nodes, 95% passby */
+          DEBUG1("\n**** not found candidate_node,");
           if (UR(100) > 95) {
+              DEBUG1("random run\n");
+              cfg_rand_fuzz_cnt++;
               plain_afl = true;
           } else {
+            DEBUG1("abondon run\n");
             return 1;
           }
       } else {
         ((u32 *)trace_bits)[(MAP_SIZE >> 2) + 1] = hit_node->addr;
         hit_node->fuzz_cnt++;
+        DEBUG1("\n**** target candidate node is 0x%x\n", hit_node->addr);
+        cfg_candidate_fuzz_cnt++;
         cfg_adjust_candidate_node(hit_node);
       }
   }
@@ -7588,7 +7617,10 @@ skip_extras:
    ****************/
 
 havoc_stage:
-   
+  if (hit_node != NULL && hit_node->is_candidate == false) {
+    goto abandon_entry;
+  }
+
   stage_cur_byte = -1;
 
   /* The havoc stage mutation code is also invoked when splicing files; if the
@@ -8073,7 +8105,7 @@ havoc_stage:
     /* If we're finding new stuff, let's run for a bit longer, limits
        permitting. */
 
-    if (queued_paths != havoc_queued) {
+    if (queued_paths != havoc_queued && (hit_node != NULL && hit_node->is_candidate == true)) {
 
       if (perf_score <= HAVOC_MAX_MULT * 100) {
         stage_max  *= 2;
@@ -9698,13 +9730,12 @@ int main(int argc, char** argv) {
 
       if (sync_id && queue_cycle == 1 && getenv("AFL_IMPORT_FIRST"))
         sync_fuzzers(use_argv);
-
-      cfg_log_candidate_nodes();
-
     }
 
+    DEBUG1("\n>>>>>> Begin to fuzz_one!\n");
+    cfg_log_candidate_nodes();
     skipped_fuzz = fuzz_one(use_argv);
-
+    DEBUG1("\n>>>>>> End of fuzz_one\n\tfuzz times: tot %ld, candidate %ld, random %ld\n", cfg_tot_fuzz_cnt, cfg_candidate_fuzz_cnt, cfg_rand_fuzz_cnt);
     if (!stop_soon && sync_id && !skipped_fuzz) {
       
       if (!(sync_interval_cnt++ % SYNC_INTERVAL))
