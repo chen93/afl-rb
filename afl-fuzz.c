@@ -52,6 +52,7 @@
 #include <stdbool.h>
 #include <stdarg.h>
 #include <limits.h>
+#include <assert.h>
 
 #include <sys/wait.h>
 #include <sys/time.h>
@@ -902,9 +903,9 @@ static __attribute__((unused)) void cfg_log_candidate_nodes()
 {
     struct cfg_node *cur = candidate_nodes;
     int i = 0;
-    DEBUG1("\n#### log candidate nodes ####\n");
+    DEBUG1("\n#### log candidate nodes %d ####\n", candidate_nodes_cnt);
     while (cur != NULL) {
-        DEBUG1("id %2d: 0x%8x %6.2f  %3d %2d %8d\n", i, cur->addr, cur->score, cur->covered_blocks, cur->depth, cur->fuzz_cnt);
+        DEBUG1("id %2d: %8x %6.2f  %3d %2d %8d\n", i, cur->addr, cur->score, cur->covered_blocks, cur->depth, cur->fuzz_cnt);
         cur = cur->next;
         i++;
     }
@@ -1220,9 +1221,19 @@ static void cfg_generate_node_bits(u8* nodes_bits, u8* trace_bits)
             next = e->next_node;
 
             idx = cfg_find_node_idx(cur->addr);
+            if (idx >= cfg_hash_size) {
+                DEBUG1("new node addr!!!\n");
+                i++;
+                continue;
+            }
             nodes_bits[idx] = 1;
 
             idx = cfg_find_node_idx(next->addr);
+            if (idx >= cfg_hash_size) {
+                DEBUG1("new node addr!!!\n");
+                i++;
+                continue;
+            }
             nodes_bits[idx] = 1;
         }
         i++;
@@ -1963,7 +1974,7 @@ static inline u8 has_new_bits(u8* virgin_map, bool need_update_candidate) {
                     }
                 }
             }
-        } else ret = 1;
+        } else ret = MAX(1, ret);
 
 #else
 
@@ -1978,7 +1989,7 @@ static inline u8 has_new_bits(u8* virgin_map, bool need_update_candidate) {
                     }
                 }
             }
-        } else ret = 1;
+        } else ret = MAX(1, ret);
 
 #endif /* ^__x86_64__ */
 //      }
@@ -5703,11 +5714,10 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   }
 
-  if (rb_fuzzing){
+  if (!plain_afl){
     total_branch_tries++;
-    if (hits_branch(rb_fuzzing - 1)){
+    if (hits_candidate_node()){
       successful_branch_tries++;
-    } else {
     }
   }
 
@@ -6154,6 +6164,7 @@ static u8 fuzz_one(char** argv) {
 
   /* @afl-cfg Var */
   struct cfg_node *hit_node = NULL;
+  bool has_branch_mask = false;
  plain_afl = false;
 
  if (skip_deterministic){
@@ -6203,8 +6214,11 @@ static u8 fuzz_one(char** argv) {
 
 #endif /* ^IGNORE_FINDS */
 
+    DEBUG1("\n>>>>>> Begin to fuzz_one!\n");
+    cfg_log_candidate_nodes();
   /* select inputs which hit candidate nodes */
 
+  assert(candidate_nodes_cnt != 0);
   if (candidate_nodes_cnt == 0) {
       /* regular afl */
       plain_afl = true;
@@ -6252,7 +6266,6 @@ static u8 fuzz_one(char** argv) {
           }
       }
 
-      cfg_tot_fuzz_cnt++;
       if (hit_node == NULL) {
           /* if this input not hit top 10% candidate nodes, 95% passby */
           DEBUG1("\n**** not found candidate_node,");
@@ -6267,11 +6280,12 @@ static u8 fuzz_one(char** argv) {
       } else {
         ((u32 *)trace_bits)[(MAP_SIZE >> 2) + 1] = hit_node->addr;
         hit_node->fuzz_cnt++;
-        DEBUG1("\n**** target candidate node is 0x%x\n", hit_node->addr);
+        DEBUG1("\n**** target candidate node is %x\n", hit_node->addr);
         cfg_candidate_fuzz_cnt++;
         cfg_adjust_candidate_node(hit_node);
       }
   }
+  cfg_tot_fuzz_cnt++;
 
   if (not_on_tty) {
     ACTF("Fuzzing test case #%u (%u total, %llu uniq crashes found)...",
@@ -6302,6 +6316,16 @@ static u8 fuzz_one(char** argv) {
   subseq_tmouts = 0;
 
   cur_depth = queue_cur->depth;
+
+  if (!plain_afl) {
+    write_to_testcase(in_buf, len);
+    run_target(argv, exec_tmout);
+    if (!hits_candidate_node()){
+        DEBUG1("input %s not hit the candidate_node!\n", queue_cur->fname);
+    } else {
+        DEBUG1("input %s hit the candidate_node!\n", queue_cur->fname);
+    }
+  }
 
   /*******************************************
    * CALIBRATION (only if failed earlier on) *
@@ -6616,6 +6640,7 @@ skip_simple_bitflip:
     if (!plain_afl && !shadow_mode && use_branch_mask > 0)
       if (hits_candidate_node()){
         branch_mask[stage_cur] = 1;
+        has_branch_mask = true;
      }
 
     /* We also use this stage to pull off a simple trick: we identify
@@ -6692,6 +6717,7 @@ skip_simple_bitflip:
       /* if even with this byte deleted we hit the branch, can delete here */
       if (hits_candidate_node()){
         branch_mask[stage_cur] += 2;
+        has_branch_mask = true;
       }
     }
 
@@ -6711,6 +6737,7 @@ skip_simple_bitflip:
       /* if adding before still hit branch, can add */
       if (hits_candidate_node()){
         branch_mask[stage_cur] += 4;
+        has_branch_mask = true;
       }
 
     }
@@ -6721,7 +6748,11 @@ skip_simple_bitflip:
   }
 
   /* @RB@ reset stats for debugging*/
-  //DEBUG1("%swhile calibrating, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
+  DEBUG1("plain afl =  %d,  has_branch_mask = %d \nbranch_mask is: ", plain_afl, has_branch_mask);
+  for (stage_cur = 0; stage_cur < len+1; stage_cur++){
+    DEBUG1("%d", branch_mask[stage_cur]);
+  }
+  DEBUG1("\n%swhile calibrating, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
   //DEBUG1("%scalib stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
   //DEBUG1("%scalib stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
   successful_branch_tries = 0;
@@ -7625,7 +7656,7 @@ skip_extras:
   if (!queue_cur->passed_det) mark_as_det_done(queue_cur);
 
   /* @RB@ reset stats for debugging*/
-  //DEBUG1("%sIn deterministic stage, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
+  DEBUG1("%sIn deterministic stage, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
   //DEBUG1("%sdet stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
   //DEBUG1("%sdet stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
 
@@ -8272,11 +8303,13 @@ abandon_entry:
   }
 
   /* @RB@ reset stats for debugging*/
-  //DEBUG1("%sIn havoc stage, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
+  DEBUG1("%sIn havoc stage, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
   successful_branch_tries = 0;
   total_branch_tries = 0;
   //DEBUG1("%shavoc stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
   //DEBUG1("%shavoc stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
+    DEBUG1("\n>>>>>> End of fuzz_one\n\tfuzz times: tot %ld, candidate %ld, random %ld\n", cfg_tot_fuzz_cnt, cfg_candidate_fuzz_cnt, cfg_rand_fuzz_cnt);
+    //DEBUG1("branch succ / tries: %d / %d \n", successful_branch_tries, total_branch_tries);
   if (shadow_mode) goto re_run;
 
   if (queued_with_cov-orig_queued_with_cov){
@@ -9752,10 +9785,7 @@ int main(int argc, char** argv) {
         sync_fuzzers(use_argv);
     }
 
-    DEBUG1("\n>>>>>> Begin to fuzz_one!\n");
-    cfg_log_candidate_nodes();
     skipped_fuzz = fuzz_one(use_argv);
-    DEBUG1("\n>>>>>> End of fuzz_one\n\tfuzz times: tot %ld, candidate %ld, random %ld\n", cfg_tot_fuzz_cnt, cfg_candidate_fuzz_cnt, cfg_rand_fuzz_cnt);
     if (!stop_soon && sync_id && !skipped_fuzz) {
       
       if (!(sync_interval_cnt++ % SYNC_INTERVAL))
