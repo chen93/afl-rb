@@ -903,7 +903,7 @@ static __attribute__((unused)) void cfg_log_candidate_nodes()
 {
     struct cfg_node *cur = candidate_nodes;
     int i = 0;
-    DEBUG1("\n#### log candidate nodes %d ####\n", candidate_nodes_cnt);
+    DEBUG1("#### log candidate nodes %d ####\n", candidate_nodes_cnt);
     while (cur != NULL) {
         DEBUG1("id %2d: %8x %6.2f  %3d %2d %8d\n", i, cur->addr, cur->score, cur->covered_blocks, cur->depth, cur->fuzz_cnt);
         cur = cur->next;
@@ -951,7 +951,7 @@ static void cfg_insert_candidate_node(struct cfg_node *node)
     cur = candidate_nodes;
     prev = NULL;
 
-    DEBUG1("CFG: insert node 0x%x\n", node->addr);
+    DEBUG1("CFG: insert node %x\n", node->addr);
 
     while(cur != NULL) {
         if (cur->score <= node->score) {
@@ -1044,7 +1044,7 @@ static void cfg_remove_candidate_node(struct cfg_node *node)
         return;
     }
 
-    DEBUG1("CFG: remove node 0x%x\n", node->addr);
+    DEBUG1("CFG: remove node %x\n", node->addr);
 
     if (candidate_nodes == node) {
         candidate_nodes = node->next;
@@ -6156,7 +6156,6 @@ static u8 fuzz_one(char** argv) {
   u8 rb_skip_deterministic = 0;
   u8 skip_simple_bitflip = 0;
   u8 * virgin_virgin_bits = 0;
-  char * shadow_prefix = "";
   u32 * position_map = NULL;
   u32 orig_queued_with_cov = queued_with_cov;
   u32 orig_queued_discovered = queued_discovered;
@@ -6280,7 +6279,7 @@ static u8 fuzz_one(char** argv) {
       } else {
         ((u32 *)trace_bits)[(MAP_SIZE >> 2) + 1] = hit_node->addr;
         hit_node->fuzz_cnt++;
-        DEBUG1("\n**** target candidate node is %x\n", hit_node->addr);
+        DEBUG1("** target candidate node is %x\n", hit_node->addr);
         cfg_candidate_fuzz_cnt++;
         cfg_adjust_candidate_node(hit_node);
       }
@@ -6425,7 +6424,6 @@ re_run: // re-run when running in shadow mode
       shadow_mode = 1;
       virgin_virgin_bits = ck_alloc(MAP_SIZE);
       memcpy(virgin_virgin_bits, virgin_bits, MAP_SIZE);
-      shadow_prefix = "PLAIN AFL: ";
     } else if (run_with_shadow && shadow_mode) {
       // reset all stats. nothing is added to queue.  
       shadow_mode = 0;
@@ -6435,7 +6433,6 @@ re_run: // re-run when running in shadow mode
       total_execs = orig_total_execs;
       memcpy(virgin_bits, virgin_virgin_bits, MAP_SIZE);
       ck_free(virgin_virgin_bits);
-      shadow_prefix = "RB: ";
     }
 
   }
@@ -6588,7 +6585,7 @@ re_run: // re-run when running in shadow mode
   stage_cycles[STAGE_FLIP1] += stage_max;
 
   /* @RB@ */
-  DEBUG1("%swhile bitflipping, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
+  DEBUG1("[bitflip 1/1] %i of %i tries\n", successful_branch_tries, total_branch_tries);
 
 
 skip_simple_bitflip:
@@ -6748,11 +6745,11 @@ skip_simple_bitflip:
   }
 
   /* @RB@ reset stats for debugging*/
-  DEBUG1("plain afl =  %d,  has_branch_mask = %d \nbranch_mask is: ", plain_afl, has_branch_mask);
+  DEBUG1("plain afl =  %d,  has_branch_mask = %d, branch_mask is: ", plain_afl, has_branch_mask);
   for (stage_cur = 0; stage_cur < len+1; stage_cur++){
     DEBUG1("%d", branch_mask[stage_cur]);
   }
-  DEBUG1("\n%swhile calibrating, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
+  DEBUG1("\n[bitflip 8/8] %i of %i tries\n", successful_branch_tries, total_branch_tries);
   //DEBUG1("%scalib stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
   //DEBUG1("%scalib stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
   successful_branch_tries = 0;
@@ -6774,7 +6771,7 @@ skip_simple_bitflip:
 
     stage_cur_byte = stage_cur >> 3;
 
-    if (rb_fuzzing){ //&& use_mask()){
+    if (!plain_afl){ //&& use_mask()){
       // only run modified case if it won't produce garbage
 
       if (!(branch_mask[stage_cur_byte] & 1)) {
@@ -6817,7 +6814,7 @@ skip_simple_bitflip:
 
     stage_cur_byte = stage_cur >> 3;
 
-    if (rb_fuzzing){//&& use_mask()){
+    if (!plain_afl){//&& use_mask()){
       // only run modified case if it won't produce garbage
       if (!(branch_mask[stage_cur_byte] & 1)) {
         stage_max--;
@@ -6871,7 +6868,7 @@ skip_simple_bitflip:
       continue;
     }
 
-    if (rb_fuzzing ){
+    if (!plain_afl){
       // skip if either byte will modify the branch
       if (!(branch_mask[i] & 1) || !(branch_mask[i+1] & 1) ){
         stage_max--;
@@ -6917,7 +6914,7 @@ skip_simple_bitflip:
     }
 
 
-    if (rb_fuzzing){
+    if (!plain_afl){
       // skip if either byte will modify the branch
       if (!(branch_mask[i] & 1) || !(branch_mask[i+1]& 1) ||
             !(branch_mask[i+2]& 1) || !(branch_mask[i+3]& 1) ){
@@ -6941,6 +6938,10 @@ skip_simple_bitflip:
 
   stage_finds[STAGE_FLIP32]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_FLIP32] += stage_max;
+
+  DEBUG1("[bitflip x/x] %i of %i tries\n", successful_branch_tries, total_branch_tries);
+  successful_branch_tries = 0;
+  total_branch_tries = 0;
 
 skip_bitflip:
 
@@ -6972,7 +6973,7 @@ skip_bitflip:
       continue;
     }
 
-    if (rb_fuzzing){
+    if (!plain_afl){
       if (!(branch_mask[i]& 1) ){
         stage_max -= 2 * ARITH_MAX;
         continue;
@@ -7043,7 +7044,7 @@ skip_bitflip:
       continue;
     }
 
-    if (rb_fuzzing){
+    if (!plain_afl){
       if (!(branch_mask[i] & 1) || !(branch_mask[i+1] & 1)){
         stage_max -= 4 * ARITH_MAX;
         continue;
@@ -7145,7 +7146,7 @@ skip_bitflip:
       continue;
     }
 
-    if (rb_fuzzing ){
+    if (!plain_afl){
       // skip if either byte will modify the branch
       if (!(branch_mask[i] & 1) || !(branch_mask[i+1]& 1) ||
             !(branch_mask[i+2]& 1) || !(branch_mask[i+3]& 1)){
@@ -7223,6 +7224,10 @@ skip_bitflip:
   stage_finds[STAGE_ARITH32]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_ARITH32] += stage_max;
 
+  DEBUG1("[arith] %i of %i tries\n", successful_branch_tries, total_branch_tries);
+  successful_branch_tries = 0;
+  total_branch_tries = 0;
+
 skip_arith:
 
   /**********************
@@ -7251,7 +7256,7 @@ skip_arith:
       continue;
     }
 
-    if (rb_fuzzing ){
+    if (!plain_afl){
       if (!(branch_mask[i]& 1)){
         stage_max -= sizeof(interesting_8);
         continue;
@@ -7310,7 +7315,7 @@ skip_arith:
     }
 
 
-    if (rb_fuzzing ){
+    if (!plain_afl){
       // skip if either byte will modify the branch
       if (!(branch_mask[i] & 1) || !(branch_mask[i+1] & 1)){
         stage_max -= sizeof(interesting_16);
@@ -7388,7 +7393,7 @@ skip_arith:
       continue;
     }
 
-    if (rb_fuzzing ){
+    if (!plain_afl){
       // skip if any byte will modify the branch
       if (!(branch_mask[i] & 1) || !(branch_mask[i+1]& 1) ||
             !(branch_mask[i+2]& 1) || !(branch_mask[i+3]& 1)){
@@ -7443,6 +7448,10 @@ skip_arith:
   stage_finds[STAGE_INTEREST32]  += new_hit_cnt - orig_hit_cnt;
   stage_cycles[STAGE_INTEREST32] += stage_max;
 
+  DEBUG1("[interest] %i of %i tries\n", successful_branch_tries, total_branch_tries);
+  successful_branch_tries = 0;
+  total_branch_tries = 0;
+
 skip_interest:
 
   /********************
@@ -7489,7 +7498,7 @@ skip_interest:
         continue;
       }
  
-      if (rb_fuzzing ){//&& use_mask()){
+      if (!plain_afl){//&& use_mask()){
       // if any fall outside the mask, skip
         int bailing = 0;
         for (int ii = 0; ii < extras[j].len; ii ++){
@@ -7612,7 +7621,7 @@ skip_user_extras:
       }
 
       // if any fall outside the mask, skip
-      if (rb_fuzzing){ 
+      if (!plain_afl) { 
       // if any fall outside the mask, skip
         int bailing = 0;
         for (int ii = 0; ii < a_extras[j].len; ii ++){
@@ -7656,7 +7665,7 @@ skip_extras:
   if (!queue_cur->passed_det) mark_as_det_done(queue_cur);
 
   /* @RB@ reset stats for debugging*/
-  DEBUG1("%sIn deterministic stage, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
+  DEBUG1("[dictionary] %i of %i tries\n", successful_branch_tries, total_branch_tries);
   //DEBUG1("%sdet stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
   //DEBUG1("%sdet stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
 
@@ -8303,12 +8312,12 @@ abandon_entry:
   }
 
   /* @RB@ reset stats for debugging*/
-  DEBUG1("%sIn havoc stage, %i of %i tries hit branch %i\n", shadow_prefix, successful_branch_tries, total_branch_tries, rb_fuzzing - 1);
+  DEBUG1("[havoc] %i of %i tries\n", successful_branch_tries, total_branch_tries);
   successful_branch_tries = 0;
   total_branch_tries = 0;
   //DEBUG1("%shavoc stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
   //DEBUG1("%shavoc stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
-    DEBUG1("\n>>>>>> End of fuzz_one\n\tfuzz times: tot %ld, candidate %ld, random %ld\n", cfg_tot_fuzz_cnt, cfg_candidate_fuzz_cnt, cfg_rand_fuzz_cnt);
+  DEBUG1("\n>>>>>> End of fuzz_one\n\tfuzz times: tot %ld, candidate %ld, random %ld\n\n\n", cfg_tot_fuzz_cnt, cfg_candidate_fuzz_cnt, cfg_rand_fuzz_cnt);
     //DEBUG1("branch succ / tries: %d / %d \n", successful_branch_tries, total_branch_tries);
   if (shadow_mode) goto re_run;
 
