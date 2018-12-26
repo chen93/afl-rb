@@ -316,6 +316,7 @@ struct cfg_node {
     u32 covered_blocks;     /* how many blocks is covered by this node,
                                only count CFG_BLOCK_LEVEL below */
     u32 fuzz_cnt;
+    u32 hit_cnt;
     double score;
 
     u32 s_size;             /* node's successors number */
@@ -325,15 +326,25 @@ struct cfg_node {
     struct cfg_node **predecessors;
 
     bool is_candidate;
-    struct cfg_node *next;  /* for candidate_nodes list */
-    struct cfg_node *prev;  /* for candidate_nodes list */
+};
+
+struct cfg_node_info {
+    u8 mapped;
+    u32 addr;
 };
 
 static int cfg_nodes_cnt = 0;
 static int cfg_hash_size = 0;
-static int candidate_nodes_cnt = 0;
 static struct cfg_node *cfg_nodes;
-static struct cfg_node *candidate_nodes;
+EXP_ST u8* node_bits;                /* SHM with node bitmap  */
+EXP_ST struct cfg_node_info *cfg_nodes_info;
+static struct cfg_node *hit_node = NULL;
+EXP_ST bool cfg_visited_new;
+EXP_ST struct cfg_candidate_node {
+    int cnt;
+    int max_size;
+    struct cfg_node **p;
+} cfg_candidate_nodes;
 
 /* @afl-cfg: control flow graph edge information */
 enum JumpKind {
@@ -901,13 +912,12 @@ static void cfg_update_nodes_depth(struct cfg_node *root)
 
 static __attribute__((unused)) void cfg_log_candidate_nodes()
 {
-    struct cfg_node *cur = candidate_nodes;
+    struct cfg_node *cur;
     int i = 0;
-    DEBUG1("#### log candidate nodes %d ####\n", candidate_nodes_cnt);
-    while (cur != NULL) {
-        DEBUG1("id %2d: %8x %6.2f  %3d %2d %8d\n", i, cur->addr, cur->score, cur->covered_blocks, cur->depth, cur->fuzz_cnt);
-        cur = cur->next;
-        i++;
+    DEBUG1("#### log candidate nodes %d ####\n", cfg_candidate_nodes.cnt);
+    for (i = 0; i < cfg_candidate_nodes.cnt; i++) {
+        cur = cfg_candidate_nodes.p[i];
+        DEBUG1("id %2d: %8x %6.2f  %3d %2d %8d\n", i, cur->addr, cur->score, cur->covered_blocks, cur->depth, cur->hit_cnt);
     }
 }
 
@@ -928,6 +938,13 @@ static void cfg_nodes_init()
     }
 }
 
+static int cfg_candidate_node_cmp(const void* p1, const void* p2) {
+  struct cfg_node *e1 = *((struct cfg_node **)p1),
+                  *e2 = *((struct cfg_node **)p2);
+
+  return e2->score - e1->score;
+}
+
 /* calculate the candidate_node's score */
 static void cfg_set_node_score(struct cfg_node *node)
 {
@@ -935,130 +952,59 @@ static void cfg_set_node_score(struct cfg_node *node)
         node->score = 0;
     }
 
-    node->score = node->covered_blocks * node->covered_blocks * 100000.0
-        / ((node->fuzz_cnt + 1) * (node->depth + 1));
+    node->score = node->covered_blocks * node->covered_blocks * 100000000.0
+        / (node->hit_cnt);
 
     return;
+}
+
+static void cfg_sort_candidate_nodes()
+{
+    u32 i;
+
+    for (i = 0; i < cfg_candidate_nodes.cnt; i++) {
+        cfg_set_node_score(cfg_candidate_nodes.p[i]);
+    }
+
+    qsort(cfg_candidate_nodes.p, cfg_candidate_nodes.cnt, sizeof(struct cfg_node *), cfg_candidate_node_cmp);
 }
 
 /* insert a new node to candidate_nodes list in descending order of score */
 static void cfg_insert_candidate_node(struct cfg_node *node)
 {
-    struct cfg_node *cur, *prev;
-
-    cfg_set_node_score(node);
-
-    cur = candidate_nodes;
-    prev = NULL;
-
     DEBUG1("CFG: insert node %x\n", node->addr);
 
-    while(cur != NULL) {
-        if (cur->score <= node->score) {
-            break;
-        }
-        prev = cur;
-        cur = cur->next;
+    if (cfg_candidate_nodes.cnt == cfg_candidate_nodes.max_size) {
+        cfg_candidate_nodes.p = ck_realloc(cfg_candidate_nodes.p, cfg_candidate_nodes.max_size + 1000);
+        cfg_candidate_nodes.max_size += 1000;
     }
 
-    if (prev == NULL) {
-        /* head of candidate_nodes */
-        candidate_nodes = node;
-        node->next = cur;
-        if (cur != NULL) {
-            cur->prev = node;
-        }
-    } else if (cur == NULL) {
-        /* tail of candidate_nodes */
-        prev->next = node;
-        node->prev = prev;
-    } else {
-        prev->next = node;
-        node->prev = prev;
-        cur->prev = node;
-        node->next = cur;
-    }
-    candidate_nodes_cnt++;
+    cfg_candidate_nodes.p[cfg_candidate_nodes.cnt] = node;
     node->is_candidate = true;
-}
-
-/* adjust the node position in candidate_nodes list */
-static void cfg_adjust_candidate_node(struct cfg_node *node)
-{
-    struct cfg_node *cur = node, *prev;
-    double old_score = node->score;
-
-    //DEBUG1("CFG: adjust node 0x%x\n", node->addr);
-
-    cfg_set_node_score(node);
-
-    if (old_score > node->score) {
-        cur = node->next;
-        prev = node->prev;
-
-        /* delete node from the list */
-        if (prev != NULL)
-            prev->next = cur;
-        else
-            candidate_nodes = cur;
-        if (cur != NULL)
-            cur->prev = prev;
-
-        /* find new position */
-        while(cur != NULL) {
-            if (node->score > cur->score) {
-                break;
-            }
-            prev = cur;
-            cur = cur->next;
-        }
-        if (prev == NULL) {
-            /* head of candidate_nodes */
-            candidate_nodes = node;
-            node->next = cur;
-            node->prev = NULL;
-            cur->prev = node;
-        } else if (cur == NULL) {
-            /* tail of candidate_nodes */
-            prev->next = node;
-            node->prev = prev;
-            node->next = NULL;
-        } else {
-            prev->next = node;
-            node->prev = prev;
-            cur->prev = node;
-            node->next = cur;
-        }
-    } else if (old_score == node->score) {
-        /* do nothing */
-    } else {
-        FATAL("adjust candidate node fail, score only can be smaller than old one.\n");
-    }
-
+    cfg_candidate_nodes.cnt++;
 }
 
 /* remove the node from candidate_nodes list */
 static void cfg_remove_candidate_node(struct cfg_node *node)
 {
+    u32 i;
     if (node->is_candidate == false) {
         return;
     }
 
     DEBUG1("CFG: remove node %x\n", node->addr);
 
-    if (candidate_nodes == node) {
-        candidate_nodes = node->next;
+    for (i = 0; i < cfg_candidate_nodes.cnt; i++) {
+        if (cfg_candidate_nodes.p[i] == node) {
+            break;
+        }
+    }
+    for (;i < cfg_candidate_nodes.cnt - 1; i++) {
+        cfg_candidate_nodes.p[i] = cfg_candidate_nodes.p[i + 1];
     }
 
-    if (node->next)
-        node->next->prev = node->prev;
-    if (node->prev)
-        node->prev->next = node->next;
-
-    node->next = NULL;
-    node->prev = NULL;
-
-    candidate_nodes_cnt--;
+    cfg_candidate_nodes.p[cfg_candidate_nodes.cnt - 1] = NULL;
+    cfg_candidate_nodes.cnt--;
     node->is_candidate = false;
 }
 
@@ -1129,9 +1075,6 @@ static void cfg_update_predecessors_nodes(struct cfg_node *s, int l)
                     continue;
                 }
                 p->covered_blocks--;
-                if (p->is_candidate) {
-                    cfg_adjust_candidate_node(p);
-                }
                 p->covered = true;
 
                 bfs_new = malloc(sizeof(struct bfs_node_list));
@@ -1162,6 +1105,7 @@ static void cfg_visit_new_node(struct cfg_node *node)
     u8 op;
 
     DEBUG1("****** visit new node 0x%x\n", node->addr);
+    cfg_visited_new = true;
     node->visited = true;
     /* check each predecessors if is candidated */
     for (i = 0; i < node->p_size; i++) {
@@ -1190,56 +1134,30 @@ static void cfg_visit_new_node(struct cfg_node *node)
     //cfg_log_candidate_nodes();
 }
 
-static void cfg_update_edge(u32 idx) {
-    if (cfg_edges[idx].marked) {
-        if (cfg_edges[idx].cur_node->visited == false) {
-            cfg_visit_new_node(cfg_edges[idx].cur_node);
-        }
-
-        if (cfg_edges[idx].next_node->visited == false) {
-            cfg_visit_new_node(cfg_edges[idx].next_node);
+static void cfg_update_nodes(u8 *mem) {
+    u32 i;
+    cfg_visited_new = false;
+    for (i = 0; i < cfg_hash_size; i++) {
+        if (mem[i] != 0) {
+            if (cfg_nodes[i].mapped == false) {
+                cfg_nodes[i].mapped = true;
+                cfg_nodes[i].addr = cfg_nodes_info[i].addr;
+            }
+            if (cfg_nodes[i].hit_cnt == 0) {
+                cfg_visit_new_node(&cfg_nodes[i]);
+            }
+            cfg_nodes[i].hit_cnt += mem[i];
         }
     }
 }
 
-static void cfg_generate_node_bits(u8* nodes_bits, u8* trace_bits)
+static void cfg_generate_node_bits(u8* dst, u8* src)
 {
-    u32 i = 0;
-    while (i < MAP_SIZE) {
-        if (trace_bits[i] != 0) {
-            u32 idx;
-            struct cfg_edge *e = &cfg_edges[i];
-            struct cfg_node *cur, *next;
-
-            if (e->marked == false) {
-                /* TODO: edge is not record by angr cfg */
-                i++;
-                continue;
-            }
-
-            cur = e->cur_node;
-            next = e->next_node;
-
-            idx = cfg_find_node_idx(cur->addr);
-            if (idx >= cfg_hash_size) {
-                DEBUG1("new node addr!!!\n");
-                i++;
-                continue;
-            }
-            nodes_bits[idx] = 1;
-
-            idx = cfg_find_node_idx(next->addr);
-            if (idx >= cfg_hash_size) {
-                DEBUG1("new node addr!!!\n");
-                i++;
-                continue;
-            }
-            nodes_bits[idx] = 1;
-        }
-        i++;
+    u32 i;
+    for (i = 0; i < cfg_hash_size; i++) {
+        dst[i] = src[i] ? 1 : 0;
     }
 }
-
 
 /* Get unix time in milliseconds */
 
@@ -1691,7 +1609,7 @@ static void mark_as_redundant(struct queue_entry* q, u8 state) {
 /* return 0 if current trace bits hits branch with id branch_id,
   0 otherwise */
 static int hits_candidate_node(){
-  return (((u32 *)trace_bits)[MAP_SIZE >> 2] != 0);
+    return node_bits[cfg_find_node_idx(hit_node->addr)] != 0;
 }
 
 /* return 0 if current trace bits hits branch with id branch_id,
@@ -1819,7 +1737,7 @@ static void add_to_queue(u8* fname, u32 len, u8 passed_det) {
   minimize_bits(q->trace_mini, trace_bits);
 
   q->node_bits = ck_alloc(cfg_hash_size);
-  cfg_generate_node_bits(q->node_bits, trace_bits);
+  cfg_generate_node_bits(q->node_bits, node_bits);
 
   q->fuzzed_branches = ck_alloc(MAP_SIZE >>3);
   // @End
@@ -1951,7 +1869,7 @@ static inline u8 has_new_bits(u8* virgin_map, bool need_update_candidate) {
 
     if (unlikely(*current) && unlikely(*current & *virgin)) {
 
-//      if (likely(ret < 2)) {
+      if (likely(ret < 2)) {
 
         u8* cur = (u8*)current;
         u8* vir = (u8*)virgin;
@@ -1966,33 +1884,17 @@ static inline u8 has_new_bits(u8* virgin_map, bool need_update_candidate) {
             (cur[4] && vir[4] == 0xff) || (cur[5] && vir[5] == 0xff) ||
             (cur[6] && vir[6] == 0xff) || (cur[7] && vir[7] == 0xff)) {
             ret = 2;
-            if (need_update_candidate) {
-                int j;
-                for (j = 0; j < 8; j++) {
-                    if (cur[j] && vir[j] == 0xff) {
-                        cfg_update_edge(((MAP_SIZE >> 3) - i - 1) * 8 + j);
-                    }
-                }
-            }
-        } else ret = MAX(1, ret);
+        } else ret = 1;
 
 #else
 
         if ((cur[0] && vir[0] == 0xff) || (cur[1] && vir[1] == 0xff) ||
             (cur[2] && vir[2] == 0xff) || (cur[3] && vir[3] == 0xff)) {
             ret = 2;
-            if (need_update_candidate) {
-                int j;
-                for (j = 0; j < 4; j++) {
-                    if (cur[j] && vir[j] == 0xff) {
-                        cfg_update_edge(((MAP_SIZE >> 2) - i - 1) * 4 + j);
-                    }
-                }
-            }
-        } else ret = MAX(1, ret);
+        } else ret = 1;
 
 #endif /* ^__x86_64__ */
-//      }
+      }
 
       *virgin &= ~*current;
 
@@ -2323,7 +2225,7 @@ static void update_bitmap_score(struct queue_entry* q) {
 
        if (!q->node_bits) {
          q->node_bits = ck_alloc(cfg_hash_size);
-         cfg_generate_node_bits(q->node_bits, trace_bits);
+         cfg_generate_node_bits(q->node_bits, node_bits);
        }
 
        score_changed = 1;
@@ -2397,14 +2299,17 @@ static void cull_queue(void) {
 EXP_ST void setup_shm(void) {
 
   u8* shm_str;
+  /* shm include trace_bits(MAP_SIZE) cfg_hash_size cfg_nodes_info node_bits */
+  u32 shm_size = MAP_SIZE + sizeof(u32) +
+      cfg_hash_size * (sizeof(struct cfg_node_info) + sizeof(u8));
+  u32 i;
 
   if (!in_bitmap) memset(virgin_bits, 255, MAP_SIZE);
 
   memset(virgin_tmout, 255, MAP_SIZE);
   memset(virgin_crash, 255, MAP_SIZE);
 
-  /* last 2 word is hit flag and hit_node's addr */
-  shm_id = shmget(IPC_PRIVATE, MAP_SIZE + 8, IPC_CREAT | IPC_EXCL | 0600);
+  shm_id = shmget(IPC_PRIVATE, shm_size, IPC_CREAT | IPC_EXCL | 0600);
 
   if (shm_id < 0) PFATAL("shmget() failed");
 
@@ -2422,9 +2327,21 @@ EXP_ST void setup_shm(void) {
   ck_free(shm_str);
 
   trace_bits = shmat(shm_id, NULL, 0);
-  
+
   if (!trace_bits) PFATAL("shmat() failed");
 
+  *(u32 *)(trace_bits + MAP_SIZE) = cfg_hash_size;
+
+  cfg_nodes_info = (struct cfg_node_info *)(trace_bits + MAP_SIZE + sizeof(u32));
+  node_bits = (u8 *)((u8 *)cfg_nodes_info + sizeof(struct cfg_node_info) * cfg_hash_size);
+
+  memset(cfg_nodes_info, 0, sizeof(struct cfg_node_info) * cfg_hash_size);
+  for (i = 0; i < cfg_hash_size; i++) {
+    if (cfg_nodes[i].mapped == true) {
+        cfg_nodes_info[i].mapped = true;
+        cfg_nodes_info[i].addr = cfg_nodes[i].addr;
+    }
+  }
 }
 
 
@@ -3328,7 +3245,8 @@ static u8 run_target(char** argv, u32 timeout) {
      must prevent any earlier operations from venturing into that
      territory. */
 
-  memset(trace_bits, 0, MAP_SIZE + 4);
+  memset(trace_bits, 0, MAP_SIZE);
+  memset(node_bits, 0, cfg_hash_size);
   MEM_BARRIER();
 
   /* If we're running in "dumb" mode, we can't rely on the fork server
@@ -3787,7 +3705,8 @@ static void perform_dry_run(char** argv) {
     minimize_bits(q->trace_mini, trace_bits);
 
     q->node_bits = ck_alloc(cfg_hash_size);
-    cfg_generate_node_bits(q->node_bits, trace_bits);
+    cfg_generate_node_bits(q->node_bits, node_bits);
+    cfg_update_nodes(node_bits);
 
     q->fuzzed_branches = ck_alloc(MAP_SIZE >>3);
     // @End
@@ -5714,6 +5633,7 @@ EXP_ST u8 common_fuzz_stuff(char** argv, u8* out_buf, u32 len) {
 
   }
 
+  cfg_update_nodes(node_bits);
   if (!plain_afl){
     total_branch_tries++;
     if (hits_candidate_node()){
@@ -6162,8 +6082,8 @@ static u8 fuzz_one(char** argv) {
   u32 orig_total_execs = total_execs;
 
   /* @afl-cfg Var */
-  struct cfg_node *hit_node = NULL;
   bool has_branch_mask = false;
+  hit_node = NULL;
  plain_afl = false;
 
  if (skip_deterministic){
@@ -6214,55 +6134,39 @@ static u8 fuzz_one(char** argv) {
 #endif /* ^IGNORE_FINDS */
 
     DEBUG1("\n>>>>>> Begin to fuzz_one!\n");
-    cfg_log_candidate_nodes();
   /* select inputs which hit candidate nodes */
 
-  assert(candidate_nodes_cnt != 0);
-  if (candidate_nodes_cnt == 0) {
+  //assert(candidate_nodes_cnt != 0);
+  if (cfg_candidate_nodes.cnt == 0) {
       /* regular afl */
       plain_afl = true;
   } else {
       u32 idx;
-      struct cfg_node *cur = candidate_nodes;
-      for (i = 0; i < candidate_nodes_cnt; i++) {
-          if (cur->fuzz_cnt != 0) {
-              cur = cur->next;
-              continue;
-          }
+      struct cfg_node *cur, *tmp = NULL;
+
+      cfg_sort_candidate_nodes();
+
+      /* select a node to fuzz, choose the first node node fuzzed
+       * in the top 10% of candidate_nodes which hit by this input file,
+       * if all hit nodes have been fuzzed, choose the first one. */
+      for (i = 0; i < cfg_candidate_nodes.cnt / 10 + 1; i++) {
+          cur = cfg_candidate_nodes.p[i];
           idx = cfg_find_node_idx(cur->addr);
           u8 fuzz_status = queue_cur->node_bits[idx];
-          if (fuzz_status == 0) {
-              /* this input has not reached this node */
-              cur = cur->next;
-              continue;
-          } else {
+          if (fuzz_status == 1) {
+              /* this input has reacher this node, but has not fuzzed this node */
               hit_node = cur;
               queue_cur->node_bits[idx] = 2;
               break;
+          } else if (fuzz_status == 2 && tmp == NULL) {
+              /* this node has fuzzed, only need to havoc */
+              tmp = cur;
           }
       }
-      if (hit_node == NULL) {
-          cur = candidate_nodes;
-          for (i = 0; i < candidate_nodes_cnt / 10 + 1; i++) {
-              idx = cfg_find_node_idx(cur->addr);
-              u8 fuzz_status = queue_cur->node_bits[idx];
-              if (fuzz_status == 0) {
-                  /* this input has not reached this node */
-                  cur = cur->next;
-                  continue;
-              } else if (fuzz_status == 1) {
-                  /* this input has reacher this node, but has not fuzzed this node */
-                  hit_node = cur;
-                  queue_cur->node_bits[idx] = 2;
-                  break;
-              } else {
-                  /* this node has fuzzed, only need to havoc */
-                  skip_simple_bitflip = 1;
-                  rb_skip_deterministic = 1;
-                  hit_node = cur;
-                  break;
-              }
-          }
+      if (hit_node == NULL && tmp != NULL) {
+        hit_node = tmp;
+        skip_simple_bitflip = 1;
+        rb_skip_deterministic = 1;
       }
 
       if (hit_node == NULL) {
@@ -6277,13 +6181,11 @@ static u8 fuzz_one(char** argv) {
             return 1;
           }
       } else {
-        ((u32 *)trace_bits)[(MAP_SIZE >> 2) + 1] = hit_node->addr;
-        hit_node->fuzz_cnt++;
         DEBUG1("** target candidate node is %x\n", hit_node->addr);
         cfg_candidate_fuzz_cnt++;
-        cfg_adjust_candidate_node(hit_node);
       }
   }
+  cfg_log_candidate_nodes();
   cfg_tot_fuzz_cnt++;
 
   if (not_on_tty) {
@@ -9687,6 +9589,16 @@ int main(int argc, char** argv) {
   check_crash_handling();
   check_cpu_governor();
 
+  if (cfg_load_nodes() == -1) {
+    return -1;
+  }
+
+  if (cfg_load_edges() == -1) {
+    return -1;
+  }
+
+  cfg_nodes_init();
+
   setup_post();
   setup_shm();
   init_count_class16();
@@ -9712,16 +9624,6 @@ int main(int argc, char** argv) {
   if (!out_file) setup_stdio_file();
 
   check_binary(argv[optind]);
-
-  if (cfg_load_nodes() == -1) {
-    return -1;
-  }
-
-  if (cfg_load_edges() == -1) {
-    return -1;
-  }
-
-  cfg_nodes_init();
 
   start_time = get_cur_time();
 

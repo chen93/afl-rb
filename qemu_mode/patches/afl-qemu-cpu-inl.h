@@ -62,6 +62,12 @@
 /* This is equivalent to afl-as.h: */
 
 static unsigned char *afl_area_ptr;
+static unsigned char *node_bits;
+static unsigned int cfg_hash_size;
+static struct cfg_node_info {
+    unsigned char mapped;
+    unsigned int addr;
+} *cfg_nodes_info;
 
 /* Exported variables populated by the code patched into elfload.c: */
 
@@ -148,6 +154,10 @@ static void afl_setup(void) {
 
   }
 
+  cfg_hash_size = *(unsigned int *)(afl_area_ptr + MAP_SIZE);
+  cfg_nodes_info = (struct cfg_node_info *)(afl_area_ptr + MAP_SIZE + sizeof(unsigned int));
+  node_bits = (unsigned char *)((u8 *)cfg_nodes_info + sizeof(struct cfg_node_info *) * cfg_hash_size);
+
   /* pthread_atfork() seems somewhat broken in util/rcu.c, and I'm
      not entirely sure what is the cause. This disables that
      behaviour, and seems to work alright? */
@@ -223,12 +233,44 @@ static void afl_forkserver(CPUState *cpu) {
 
 }
 
+static inline unsigned int cfg_hash(unsigned int addr)
+{
+    return addr % cfg_hash_size;
+}
+
+static unsigned int cfg_node_find_idx(unsigned int addr) {
+    unsigned int old_hash, hash;
+    old_hash = hash = cfg_hash(addr);
+
+    if (cfg_nodes_info[hash].mapped == 0) {
+        cfg_nodes_info[hash].mapped = 1;
+        cfg_nodes_info[hash].addr = addr;
+        return hash;
+    }
+
+    while(cfg_nodes_info[hash].addr != addr) {
+        hash = (hash + 1) % cfg_hash_size;
+
+        if (cfg_nodes_info[hash].mapped == 0) {
+            cfg_nodes_info[hash].mapped = 1;
+            cfg_nodes_info[hash].addr = addr;
+            return hash;
+        } else if (hash == old_hash) {
+            /* hash table is full */
+            return cfg_hash_size;
+        }
+    }
+
+    return hash;
+
+}
 
 /* The equivalent of the tuple logging routine from afl-as.h. */
 
 static inline void afl_maybe_log(abi_ulong cur_loc) {
 
   static __thread abi_ulong prev_loc;
+  unsigned int idx;
 
 #if 0
   FILE *trace_log = NULL;
@@ -246,14 +288,13 @@ static inline void afl_maybe_log(abi_ulong cur_loc) {
   trace_log = fopen("qemu_trace.log", "a+");
   fprintf(trace_log, "addr: %8x prev_loc %4x ", cur_loc, prev_loc);
 #endif
-    if (cur_loc == ((u32 *)afl_area_ptr)[(MAP_SIZE >> 2) + 1]) {
-#if 0
-        trace_log = fopen("qemu_trace.log", "a+");
-        fprintf(trace_log, "candidate node %x is hit\n", cur_loc);
-        fclose(trace_log);
-#endif
-        ((u32 *)afl_area_ptr)[MAP_SIZE >> 2] = 1;
+
+  idx = cfg_node_find_idx(cur_loc);
+  if (idx != cfg_hash_size) {
+    if (node_bits[idx] != 0xff) {
+        node_bits[idx]++;
     }
+  }
   cur_loc  = (cur_loc >> 4) ^ (cur_loc << 8);
   cur_loc &= MAP_SIZE - 1;
 
