@@ -130,7 +130,8 @@ EXP_ST u8  skip_deterministic,        /* Skip deterministic stages?       */
            run_over10m,               /* Run time over 10 minutes?        */
            persistent_mode,           /* Running in persistent mode?      */
            deferred_mode,             /* Deferred forkserver mode?        */
-           fast_cal;                  /* Try to calibrate faster?         */
+           fast_cal,                  /* Try to calibrate faster?         */
+           binary_mode;               /* 0 for elf, 1 for cgc binary      */
 
 static s32 out_fd,                    /* Persistent fd for out_file       */
            dev_urandom_fd = -1,       /* Persistent fd for /dev/urandom   */
@@ -8528,9 +8529,12 @@ EXP_ST void check_binary(u8* fname) {
   }
 
 #ifndef __APPLE__
-
-  if (f_data[0] != 0x7f || memcmp(f_data + 1, "ELF", 3))
-    FATAL("Program '%s' is not an ELF binary", target_path);
+  binary_mode = 0;
+  if (f_data[0] != 0x7f || memcmp(f_data + 1, "ELF", 3)) {
+      if (f_data[0] != 0x7f || memcmp(f_data + 1, "CGC", 3))
+        FATAL("Program '%s' is not an ELF binary", target_path);
+      binary_mode = 1;
+  }
 
 #else
 
@@ -9249,7 +9253,8 @@ static char** get_qemu_argv(u8* own_loc, char** argv, int argc) {
 
   /* Workaround for a QEMU stability glitch. */
 
-  setenv("QEMU_LOG", "nochain", 1);
+  if (!binary_mode)
+    setenv("QEMU_LOG", "nochain", 1);
 
   memcpy(new_argv + 3, argv + 1, sizeof(char*) * argc);
 
@@ -9262,7 +9267,10 @@ static char** get_qemu_argv(u8* own_loc, char** argv, int argc) {
 
   if (tmp) {
 
-    cp = alloc_printf("%s/afl-qemu-trace", tmp);
+    if (!binary_mode)
+      cp = alloc_printf("%s/afl-qemu-trace", tmp);
+    else
+      cp = alloc_printf("%s/afl-qemu-trace-cgc", tmp);
 
     if (access(cp, X_OK))
       FATAL("Unable to find '%s'", tmp);
@@ -9279,7 +9287,10 @@ static char** get_qemu_argv(u8* own_loc, char** argv, int argc) {
 
     *rsl = 0;
 
-    cp = alloc_printf("%s/afl-qemu-trace", own_copy);
+    if (!binary_mode)
+      cp = alloc_printf("%s/afl-qemu-trace", own_copy);
+    else
+      cp = alloc_printf("%s/afl-qemu-trace-cgc", own_copy);
     ck_free(own_copy);
 
     if (!access(cp, X_OK)) {
@@ -9291,15 +9302,19 @@ static char** get_qemu_argv(u8* own_loc, char** argv, int argc) {
 
   } else ck_free(own_copy);
 
-  if (!access(BIN_PATH "/afl-qemu-trace", X_OK)) {
+  if (!binary_mode && !access(BIN_PATH "/afl-qemu-trace", X_OK)) {
 
     target_path = new_argv[0] = ck_strdup(BIN_PATH "/afl-qemu-trace");
     return new_argv;
 
-  }
+  } else if (binary_mode && !access(BIN_PATH "/afl-qemu-trace-cgc", X_OK)) {
 
+    target_path = new_argv[0] = ck_strdup(BIN_PATH "/afl-qemu-trace-cgc");
+    return new_argv;
+
+  }
   SAYF("\n" cLRD "[-] " cRST
-       "Oops, unable to find the 'afl-qemu-trace' binary. The binary must be built\n"
+       "Oops, unable to find the 'afl-qemu-trace(-cgc)' binary. The binary must be built\n"
        "    separately by following the instructions in qemu_mode/README.qemu. If you\n"
        "    already have the binary installed, you may need to specify AFL_PATH in the\n"
        "    environment.\n\n"
@@ -9308,7 +9323,7 @@ static char** get_qemu_argv(u8* own_loc, char** argv, int argc) {
        "    instrumented at compile time with afl-gcc. It is also possible to use it as a\n"
        "    traditional \"dumb\" fuzzer by specifying '-n' in the command line.\n");
 
-  FATAL("Failed to locate 'afl-qemu-trace'.");
+  FATAL("Failed to locate 'afl-qemu-trace(-cgc)'.");
 
 }
 

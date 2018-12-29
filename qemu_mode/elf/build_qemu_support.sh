@@ -41,16 +41,16 @@ if [ ! "`uname -s`" = "Linux" ]; then
 
 fi
 
-if [ ! -f "patches/afl-qemu-cpu-inl.h" -o ! -f "../config.h" ]; then
+if [ ! -f "patches/afl-qemu-cpu-inl.h" -o ! -f "../../config.h" ]; then
 
   echo "[-] Error: key files not found - wrong working directory?"
   exit 1
 
 fi
 
-if [ ! -f "../afl-showmap" ]; then
+if [ ! -f "../../afl-showmap" ]; then
 
-  echo "[-] Error: ../afl-showmap not found - compile AFL first!"
+  echo "[-] Error: ../../afl-showmap not found - compile AFL first!"
   exit 1
 
 fi
@@ -145,24 +145,24 @@ echo "[+] Configuration complete."
 
 echo "[*] Attempting to build QEMU (fingers crossed!)..."
 
-make || exit 1
+make -j || exit 1
 
 echo "[+] Build process successful!"
 
 echo "[*] Copying binary..."
 
-cp -f "${CPU_TARGET}-linux-user/qemu-${CPU_TARGET}" "../../afl-qemu-trace" || exit 1
+cp -f "${CPU_TARGET}-linux-user/qemu-${CPU_TARGET}" "../../../afl-qemu-trace" || exit 1
 
 cd ..
-ls -l ../afl-qemu-trace || exit 1
+ls -l ../../afl-qemu-trace || exit 1
 
-echo "[+] Successfully created '../afl-qemu-trace'."
+echo "[+] Successfully created '../../afl-qemu-trace'."
 
 if [ "$ORIG_CPU_TARGET" = "" ]; then
 
   echo "[*] Testing the build..."
 
-  cd ..
+  cd ../..
 
   make >/dev/null || exit 1
 
