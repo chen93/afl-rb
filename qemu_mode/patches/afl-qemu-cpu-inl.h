@@ -291,7 +291,7 @@ static inline void afl_maybe_log(abi_ulong cur_loc) {
 
   idx = cfg_node_find_idx(cur_loc);
   if (idx != cfg_hash_size) {
-    if (node_bits[idx] != 0xff) {
+    if (node_bits[idx] != 0xf) {
         node_bits[idx]++;
     }
   }

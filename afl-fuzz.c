@@ -313,10 +313,10 @@ struct cfg_node {
     bool mapped;            /* whether this position is used in hash table */
     bool visited;           /* whether this node is visited by some input */
     bool covered;           /* flag use to calculate covered blocks */
+    bool fuzzed;
     u32 covered_blocks;     /* how many blocks is covered by this node,
                                only count CFG_BLOCK_LEVEL below */
-    u32 fuzz_cnt;
-    u32 hit_cnt;
+    u64 hit_cnt;
     double score;
 
     u32 s_size;             /* node's successors number */
@@ -952,7 +952,7 @@ static void cfg_set_node_score(struct cfg_node *node)
         node->score = 0;
     }
 
-    node->score = node->covered_blocks * node->covered_blocks * 100000000.0
+    node->score = node->covered_blocks * 100000000.0
         / (node->hit_cnt);
 
     return;
@@ -6141,30 +6141,46 @@ static u8 fuzz_one(char** argv) {
       /* regular afl */
       plain_afl = true;
   } else {
-      u32 idx;
-      struct cfg_node *cur, *tmp = NULL;
+      u32 idx, idx_bak;
+      struct cfg_node *cur,
+                      *global_unfuzzed = NULL,
+                      *input_unfuzzed = NULL,
+                      *input_hit = NULL;
 
       cfg_sort_candidate_nodes();
 
       /* select a node to fuzz, choose the first node node fuzzed
        * in the top 10% of candidate_nodes which hit by this input file,
        * if all hit nodes have been fuzzed, choose the first one. */
-      for (i = 0; i < cfg_candidate_nodes.cnt / 10 + 1; i++) {
+      for (i = 0; i < cfg_candidate_nodes.cnt; i++) {
           cur = cfg_candidate_nodes.p[i];
           idx = cfg_find_node_idx(cur->addr);
           u8 fuzz_status = queue_cur->node_bits[idx];
           if (fuzz_status == 1) {
               /* this input has reacher this node, but has not fuzzed this node */
-              hit_node = cur;
-              queue_cur->node_bits[idx] = 2;
-              break;
-          } else if (fuzz_status == 2 && tmp == NULL) {
+              if (!cur->fuzzed) {
+                global_unfuzzed = cur;
+                idx_bak = idx;
+                break;
+              } else if (input_unfuzzed == NULL && i <= cfg_candidate_nodes.cnt / 3) {
+                input_unfuzzed = cur;
+                idx_bak = idx;
+              }
+          } else if (fuzz_status == 2 && input_unfuzzed == NULL
+                  && input_hit == NULL && i <= cfg_candidate_nodes.cnt / 5) {
               /* this node has fuzzed, only need to havoc */
-              tmp = cur;
+              input_hit = cur;
           }
       }
-      if (hit_node == NULL && tmp != NULL) {
-        hit_node = tmp;
+      if (global_unfuzzed != NULL) {
+        hit_node = global_unfuzzed;
+        hit_node->fuzzed = true;
+        queue_cur->node_bits[idx_bak] = 2;
+      } else if (input_unfuzzed != NULL) {
+        hit_node = input_unfuzzed;
+        queue_cur->node_bits[idx_bak] = 2;
+      } else if (input_hit != NULL) {
+        hit_node = input_hit;
         skip_simple_bitflip = 1;
         rb_skip_deterministic = 1;
       }
@@ -6648,9 +6664,9 @@ skip_simple_bitflip:
 
   /* @RB@ reset stats for debugging*/
   DEBUG1("plain afl =  %d,  has_branch_mask = %d, branch_mask is: ", plain_afl, has_branch_mask);
-  for (stage_cur = 0; stage_cur < len+1; stage_cur++){
-    DEBUG1("%d", branch_mask[stage_cur]);
-  }
+  //for (stage_cur = 0; stage_cur < len+1; stage_cur++){
+  //  DEBUG1("%d", branch_mask[stage_cur]);
+  //}
   DEBUG1("\n[bitflip 8/8] %i of %i tries\n", successful_branch_tries, total_branch_tries);
   //DEBUG1("%scalib stage: %i new coverage in %i total execs\n", shadow_prefix, queued_discovered-orig_queued_discovered, total_execs-orig_total_execs);
   //DEBUG1("%scalib stage: %i new branches in %i total execs\n", shadow_prefix, queued_with_cov-orig_queued_with_cov, total_execs-orig_total_execs);
