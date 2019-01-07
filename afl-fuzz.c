@@ -24,12 +24,10 @@
 
 #define AFL_MAIN
 #define MESSAGES_TO_STDOUT
-
 #define _GNU_SOURCE
 #define _FILE_OFFSET_BITS 64
 
 #define DEBUG1 fileonly
-
 #include "config.h"
 #include "types.h"
 #include "debug.h"
@@ -1624,11 +1622,27 @@ static int hits_branch(int branch_id){
    or removing parts within the branch mask
 */
 // assumes map_len is len, not len + 1. be careful. 
-static u32 get_random_modifiable_posn(u32 num_to_modify, u8 mod_type, u32 map_len, u8* branch_mask, u32 * position_map){
+static u32 get_random_modifiable_posn(u32 num_to_modify, u8 mod_type, u32 map_len, u8* branch_mask, u32 * position_map, u8 simple_havoc){
   u32 ret = 0xffffffff;
   u32 position_map_len = 0;
   int prev_start_of_1_block = -1;
   int in_0_block = 1;
+
+  if (simple_havoc) {
+      int len;
+      if (num_to_modify == 1) {
+        len = map_len << 3;
+      } else if (num_to_modify == 8) {
+        len = map_len;
+      } else if (num_to_modify == 16) {
+        len = map_len - 1;
+      } else if (num_to_modify == 32) {
+        len = map_len -3;
+      } else {
+        len = map_len - (num_to_modify / 8) + 1;
+      }
+    return UR(len);
+  }
   for (int i = 0; i < map_len; i ++){
     if (branch_mask[i] & mod_type){
       // if the last thing we saw was a zero, set
@@ -4152,7 +4166,8 @@ static u8 save_if_interesting(char** argv, void* mem, u32 len, u8 fault) {
     if (!shadow_mode) { 
       add_to_queue(fn, len, 0);
 
-      if (hnb == 2) {
+      if (hnb == 2 || cfg_visited_new == true) {
+        if (hnb != 2) DEBUG1("new visited node trigger by cfg!\n");
         queue_top->has_new_cov = 1;
         queued_with_cov++;
       }
@@ -5008,7 +5023,7 @@ static void show_stats(void) {
 
   sprintf(tmp + banner_pad, "%s " cLCY VERSION cLGN
           " (%s)",  crash_mode ? cPIN "peruvian were-rabbit" : 
-          cYEL "american fuzzy lop", use_banner);
+          cYEL "american fuzzy lop cfg", use_banner);
 
   SAYF("\n%s\n\n", tmp);
 
@@ -6076,6 +6091,7 @@ static u8 fuzz_one(char** argv) {
   u8 * orig_branch_mask = 0;
   u8 rb_skip_deterministic = 0;
   u8 skip_simple_bitflip = 0;
+  u8 simple_havoc = 0;
   u8 * virgin_virgin_bits = 0;
   u32 * position_map = NULL;
   u32 orig_queued_with_cov = queued_with_cov;
@@ -6184,6 +6200,7 @@ static u8 fuzz_one(char** argv) {
         hit_node = input_hit;
         skip_simple_bitflip = 1;
         rb_skip_deterministic = 1;
+        simple_havoc = 1;
       }
 
       if (hit_node == NULL) {
@@ -6664,7 +6681,7 @@ skip_simple_bitflip:
   }
 
   /* @RB@ reset stats for debugging*/
-  DEBUG1("plain afl =  %d,  has_branch_mask = %d, branch_mask is: ", plain_afl, has_branch_mask);
+  DEBUG1("plain afl =  %d,  has_branch_mask = %d, simple_havoc = %d, branch_mask is: ", plain_afl, has_branch_mask, simple_havoc);
   //for (stage_cur = 0; stage_cur < len+1; stage_cur++){
   //  DEBUG1("%d", branch_mask[stage_cur]);
   //}
@@ -7651,7 +7668,7 @@ havoc_stage:
 
           /* Flip a single bit somewhere. Spooky! */
 
-          if((posn = get_random_modifiable_posn(1, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
+          if((posn = get_random_modifiable_posn(1, 1, temp_len, branch_mask, position_map, simple_havoc)) == 0xffffffff) break;
           FLIP_BIT(out_buf, posn);
 
           break;
@@ -7660,7 +7677,7 @@ havoc_stage:
 
           /* Set byte to interesting value. */
 
-          if((posn = get_random_modifiable_posn(8, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
+          if((posn = get_random_modifiable_posn(8, 1, temp_len, branch_mask, position_map, simple_havoc)) == 0xffffffff) break;
           out_buf[posn] = interesting_8[UR(sizeof(interesting_8))];
           break;
 
@@ -7670,7 +7687,7 @@ havoc_stage:
 
           if (temp_len < 2) break;
 
-          if((posn = get_random_modifiable_posn(16, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
+          if((posn = get_random_modifiable_posn(16, 1, temp_len, branch_mask, position_map, simple_havoc)) == 0xffffffff) break;
           if (UR(2)) {
 
             *(u16*)(out_buf + posn) =
@@ -7691,7 +7708,7 @@ havoc_stage:
 
           if (temp_len < 4) break;
 
-          if((posn = get_random_modifiable_posn(32, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
+          if((posn = get_random_modifiable_posn(32, 1, temp_len, branch_mask, position_map, simple_havoc)) == 0xffffffff) break;
           if (UR(2)) {
   
             *(u32*)(out_buf + posn) =
@@ -7711,7 +7728,7 @@ havoc_stage:
 
           /* Randomly subtract from byte. */
 
-          if((posn = get_random_modifiable_posn(8, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
+          if((posn = get_random_modifiable_posn(8, 1, temp_len, branch_mask, position_map, simple_havoc)) == 0xffffffff) break;
           out_buf[posn] -= 1 + UR(ARITH_MAX);
           break;
 
@@ -7719,7 +7736,7 @@ havoc_stage:
 
           /* Randomly add to byte. */
 
-          if((posn = get_random_modifiable_posn(8, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
+          if((posn = get_random_modifiable_posn(8, 1, temp_len, branch_mask, position_map, simple_havoc)) == 0xffffffff) break;
           out_buf[posn] += 1 + UR(ARITH_MAX);
           break;
 
@@ -7729,7 +7746,7 @@ havoc_stage:
 
           if (temp_len < 2) break;
 
-          if((posn = get_random_modifiable_posn(16, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
+          if((posn = get_random_modifiable_posn(16, 1, temp_len, branch_mask, position_map, simple_havoc)) == 0xffffffff) break;
 
           if (UR(2)) {
 
@@ -7752,7 +7769,7 @@ havoc_stage:
 
           if (temp_len < 2) break;
 
-          if((posn = get_random_modifiable_posn(16, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
+          if((posn = get_random_modifiable_posn(16, 1, temp_len, branch_mask, position_map, simple_havoc)) == 0xffffffff) break;
 
           if (UR(2)) {
 
@@ -7775,7 +7792,7 @@ havoc_stage:
 
           if (temp_len < 4) break;
 
-          if((posn = get_random_modifiable_posn(32, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
+          if((posn = get_random_modifiable_posn(32, 1, temp_len, branch_mask, position_map, simple_havoc)) == 0xffffffff) break;
 
           if (UR(2)) {
 
@@ -7798,7 +7815,7 @@ havoc_stage:
 
           if (temp_len < 4) break;
 
-          if((posn = get_random_modifiable_posn(32, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
+          if((posn = get_random_modifiable_posn(32, 1, temp_len, branch_mask, position_map, simple_havoc)) == 0xffffffff) break;
 
           if (UR(2)) {
 
@@ -7821,7 +7838,7 @@ havoc_stage:
              why not. We use XOR with 1-255 to eliminate the
              possibility of a no-op. */
 
-          if((posn = get_random_modifiable_posn(8, 1, temp_len, branch_mask, position_map)) == 0xffffffff) break;
+          if((posn = get_random_modifiable_posn(8, 1, temp_len, branch_mask, position_map, simple_havoc)) == 0xffffffff) break;
           out_buf[posn] ^= 1 + UR(255);
           break;
 
@@ -7840,7 +7857,7 @@ havoc_stage:
 
             del_len = choose_block_len(temp_len - 1);
 
-            del_from = get_random_modifiable_posn(del_len*8, 2, temp_len, branch_mask, position_map);
+            del_from = get_random_modifiable_posn(del_len*8, 2, temp_len, branch_mask, position_map, simple_havoc);
             if (del_from == 0xffffffff) break;
 
             memmove(out_buf + del_from, out_buf + del_from + del_len,
@@ -7876,7 +7893,11 @@ havoc_stage:
               clone_from = 0;
             }
 
-            clone_to   = get_random_insert_posn(temp_len, branch_mask, position_map);
+            if (simple_havoc) {
+                clone_to = UR(temp_len);
+            } else {
+                clone_to = get_random_insert_posn(temp_len, branch_mask, position_map);
+            }
    
             if (clone_to == 0xffffffff) break; // this shouldn't happen, probably...
 
@@ -7929,7 +7950,7 @@ havoc_stage:
 
             copy_from = UR(temp_len - copy_len + 1);
 
-            copy_to   = get_random_modifiable_posn(copy_len * 8, 1, temp_len, branch_mask, position_map);
+            copy_to   = get_random_modifiable_posn(copy_len * 8, 1, temp_len, branch_mask, position_map, simple_havoc);
 
             if (copy_to == 0xffffffff) break;
 
@@ -7963,7 +7984,7 @@ havoc_stage:
 
               if (extra_len > temp_len) break;
 
-              insert_at = get_random_modifiable_posn(extra_len * 8, 1, temp_len, branch_mask, position_map);
+              insert_at = get_random_modifiable_posn(extra_len * 8, 1, temp_len, branch_mask, position_map, simple_havoc);
               if (insert_at == 0xffffffff) break;
 
               memcpy(out_buf + insert_at, a_extras[use_extra].data, extra_len);
@@ -7979,7 +8000,7 @@ havoc_stage:
               if (extra_len > temp_len) break;
 
 
-              insert_at = get_random_modifiable_posn(extra_len * 8, 1, temp_len, branch_mask, position_map);
+              insert_at = get_random_modifiable_posn(extra_len * 8, 1, temp_len, branch_mask, position_map, simple_havoc);
               if (insert_at == 0xffffffff) break;
 
               memcpy(out_buf + insert_at, extras[use_extra].data, extra_len);
@@ -7992,7 +8013,12 @@ havoc_stage:
 
         case 16: {
 
-            u32 use_extra, extra_len, insert_at = get_random_insert_posn(temp_len, branch_mask, position_map);
+            u32 use_extra, extra_len, insert_at;
+            if (simple_havoc) {
+                insert_at = UR(temp_len + 1);
+            } else {
+                insert_at = get_random_insert_posn(temp_len, branch_mask, position_map);
+            }
              if (insert_at == 0xffffffff) break;
             u8* new_buf, * new_branch_mask;
 
